@@ -1,0 +1,12 @@
+services:
+  - type: worker
+    name: saldo-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot_slots_flow.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
