@@ -3,7 +3,7 @@ import sqlite3
 from datetime import datetime
 from contextlib import contextmanager
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
-from typing import Dict, List, Tuple
+from typing import Dict, List
 from pathlib import Path
 
 from telegram import (
@@ -15,7 +15,7 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
-# ====== ENV (robusto con .env esplicito) ======
+# ====== ENV (robusto, con .env esplicito) ======
 try:
     from dotenv import load_dotenv
     DOTENV_PATH = Path(__file__).with_name(".env")
@@ -25,8 +25,11 @@ except Exception as e:
     print("DEBUG dotenv load error:", e)
 
 TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+
 _raw_admin_ids = os.getenv("ADMIN_IDS", "").strip()
 ADMIN_IDS: List[int] = [int(x) for x in _raw_admin_ids.split(",") if x.strip().isdigit()]
+
+# fallback: ADMIN_ID singolo
 if not ADMIN_IDS:
     _single = os.getenv("ADMIN_ID", "").strip()
     if _single.isdigit():
@@ -38,8 +41,9 @@ print("DEBUG ADMIN_IDS:", ADMIN_IDS)
 DB_PATH = "kwh_slots.db"
 SLOTS = (8, 3, 5)
 
-# ====== DECIMAL ======
+# ====== DECIMAL HELPERS ======
 QK = Decimal("0.0001")
+
 def qk(x: Decimal) -> Decimal:
     return x.quantize(QK, rounding=ROUND_DOWN)
 
@@ -63,7 +67,7 @@ def fmt_kwh(d: Decimal) -> str:
         return i if dec == "" else f"{i}.{dec}"
     return s
 
-# ====== DB ======
+# ====== DATABASE ======
 from sqlite3 import OperationalError
 
 @contextmanager
@@ -77,6 +81,7 @@ def db():
         conn.close()
 
 def init_db():
+    """Crea tabelle e migrazioni. Se 'approved' viene aggiunta ora, auto-approva gli utenti esistenti una sola volta."""
     with db() as conn:
         conn.execute("""
         CREATE TABLE IF NOT EXISTS users(
@@ -105,22 +110,15 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
         )
         """)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS admin_notifications(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            recharge_id INTEGER NOT NULL,
-            admin_chat_id INTEGER NOT NULL,
-            message_id INTEGER NOT NULL,
-            FOREIGN KEY(recharge_id) REFERENCES recharges(id) ON DELETE CASCADE
-        )
-        """)
 
-        # Migrazioni idempotenti
+        # Migrazioni users balances (safe)
         for col in ("balance_slot8", "balance_slot3", "balance_slot5"):
             try:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {col} REAL DEFAULT 0")
             except OperationalError:
                 pass
+
+        # Migrazioni recharges
         for alter in (
             "ALTER TABLE recharges ADD COLUMN slot INTEGER NOT NULL DEFAULT 8",
             "ALTER TABLE recharges ADD COLUMN note TEXT",
@@ -129,92 +127,78 @@ def init_db():
                 conn.execute(alter)
             except OperationalError:
                 pass
+
+        # Aggiungi 'approved' se manca e auto-approva gli utenti già presenti
+        added_approved_now = False
         try:
             conn.execute("ALTER TABLE users ADD COLUMN approved INTEGER DEFAULT 0")
-            conn.execute("UPDATE users SET approved=1 WHERE approved IS NULL OR approved=0")
+            added_approved_now = True
         except OperationalError:
             pass
+        if added_approved_now:
+            conn.execute("UPDATE users SET approved=1 WHERE approved IS NULL OR approved=0")
 
-# ====== DB helpers ======
 def ensure_user(u):
     with db() as conn:
         conn.execute("""
-            INSERT OR IGNORE INTO users(user_id, username, first_name, last_name)
-            VALUES(?,?,?,?)
+        INSERT OR IGNORE INTO users(user_id, username, first_name, last_name)
+        VALUES(?,?,?,?)
         """, (u.id, u.username or "", u.first_name or "", u.last_name or ""))
         conn.execute("""
-            UPDATE users SET username=?, first_name=?, last_name=? WHERE user_id=?
+        UPDATE users SET username=?, first_name=?, last_name=? WHERE user_id=?
         """, (u.username or "", u.first_name or "", u.last_name or "", u.id))
 
 def get_balances(user_id: int) -> Dict[int, Decimal]:
     with db() as conn:
-        cur = conn.execute("SELECT balance_slot8,balance_slot3,balance_slot5 FROM users WHERE user_id=?", (user_id,))
+        cur = conn.execute("""
+        SELECT balance_slot8, balance_slot3, balance_slot5 FROM users WHERE user_id=?
+        """, (user_id,))
         row = cur.fetchone()
         if not row:
-            return {8:qk(Decimal("0")),3:qk(Decimal("0")),5:qk(Decimal("0"))}
-        return {8:qk(Decimal(str(row[0] or 0))),3:qk(Decimal(str(row[1] or 0))),5:qk(Decimal(str(row[2] or 0)))}
+            return {8:qk(Decimal("0")), 3:qk(Decimal("0")), 5:qk(Decimal("0"))}
+        return {
+            8: qk(Decimal(str(row[0] or 0))),
+            3: qk(Decimal(str(row[1] or 0))),
+            5: qk(Decimal(str(row[2] or 0))),
+        }
 
-def set_balance_slot(user_id:int, slot:int, new_bal:Decimal):
-    col = {8:"balance_slot8",3:"balance_slot3",5:"balance_slot5"}[slot]
+def set_balance_slot(user_id, slot: int, new_bal: Decimal):
+    col = {8:"balance_slot8", 3:"balance_slot3", 5:"balance_slot5"}[slot]
     with db() as conn:
         conn.execute(f"UPDATE users SET {col}=? WHERE user_id=?", (float(qk(new_bal)), user_id))
 
-def add_balance_slot(user_id:int, slot:int, delta:Decimal):
-    b = get_balances(user_id)
-    set_balance_slot(user_id, slot, b[slot] + qk(delta))
+def add_balance_slot(user_id, slot: int, delta: Decimal):
+    bals = get_balances(user_id)
+    set_balance_slot(user_id, slot, bals[slot] + qk(delta))
 
-def create_recharge(user_id:int, slot:int, kwh:Decimal, photo_file_id:str, note:str|None=None) -> int:
+def create_recharge(user_id, slot: int, kwh: Decimal, photo_file_id, note=None) -> int:
     with db() as conn:
         cur = conn.execute("""
-            INSERT INTO recharges(user_id,slot,kwh,photo_file_id,status,created_at,note)
-            VALUES(?,?,?,?,'pending',?,?)
-        """, (user_id,slot,float(qk(kwh)),photo_file_id,datetime.utcnow().isoformat(),note or ""))
+        INSERT INTO recharges(user_id, slot, kwh, photo_file_id, status, created_at, note)
+        VALUES(?, ?, ?, ?, 'pending', ?, ?)
+        """, (user_id, slot, float(qk(kwh)), photo_file_id, datetime.utcnow().isoformat(), note or ""))
         return cur.lastrowid
 
-def get_recharge(rid:int):
+def get_recharge(rid):
     with db() as conn:
         cur = conn.execute("SELECT id,user_id,slot,kwh,photo_file_id,status,note FROM recharges WHERE id=?", (rid,))
         return cur.fetchone()
 
-def set_recharge_status(rid:int, status:str, reviewer_id:int, note:str|None=None):
+def set_recharge_status(rid, status, reviewer_id, note=None):
     with db() as conn:
         conn.execute("""
-            UPDATE recharges SET status=?, reviewed_at=?, reviewer_id=?, note=COALESCE(note,'')
-            WHERE id=?
+        UPDATE recharges
+        SET status=?, reviewed_at=?, reviewer_id=?, note=COALESCE(note,'')
+        WHERE id=?
         """, (status, datetime.utcnow().isoformat(), reviewer_id, rid))
         if note:
             conn.execute("UPDATE recharges SET note=? WHERE id=?", (note, rid))
-
-def save_admin_notification(recharge_id:int, admin_chat_id:int, message_id:int):
-    with db() as conn:
-        conn.execute("""
-            INSERT INTO admin_notifications(recharge_id,admin_chat_id,message_id)
-            VALUES(?,?,?)
-        """, (recharge_id, admin_chat_id, message_id))
-
-def get_admin_notifications(recharge_id:int) -> List[Tuple[int,int]]:
-    with db() as conn:
-        cur = conn.execute("""
-            SELECT admin_chat_id, message_id
-            FROM admin_notifications
-            WHERE recharge_id=?
-        """, (recharge_id,))
-        return cur.fetchall()
-
-def sum_pending_for(user_id:int, slot:int) -> Decimal:
-    with db() as conn:
-        cur = conn.execute("""
-            SELECT COALESCE(SUM(kwh),0) FROM recharges
-            WHERE user_id=? AND slot=? AND status='pending'
-        """, (user_id, slot))
-        s = cur.fetchone()[0] or 0
-        return qk(Decimal(str(s)))
 
 # ====== HELPERS ======
 def is_admin(uid:int) -> bool:
     return uid in ADMIN_IDS
 
-def is_user_approved(user_id:int) -> bool:
+def is_user_approved(user_id: int) -> bool:
     with db() as conn:
         cur = conn.execute("SELECT approved FROM users WHERE user_id=?", (user_id,))
         row = cur.fetchone()
@@ -309,7 +293,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text("Richiesta inviata. Il tuo account è in attesa di approvazione da parte di un amministratore.")
+    # Utente non approvato: notifica tutti gli admin
+    await update.message.reply_text(
+        "Richiesta inviata. Il tuo account è in attesa di approvazione da parte di un amministratore."
+    )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Approva utente", callback_data=f"user:approve:{u.id}")],
         [InlineKeyboardButton("Rifiuta utente",  callback_data=f"user:reject:{u.id}")]
@@ -319,7 +306,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=aid,
                 text=(f"Nuovo utente in attesa di approvazione:\n"
-                      f"- ID: {u.id}\n- Username: @{u.username or '-'}\n- Nome: {u.first_name or ''} {u.last_name or ''}"),
+                      f"- ID: {u.id}\n"
+                      f"- Username: @{u.username or '-'}\n"
+                      f"- Nome: {u.first_name or ''} {u.last_name or ''}"),
                 reply_markup=kb
             )
         except:
@@ -347,7 +336,8 @@ async def annulla(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_ricarica_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard_approved(update, context):
         return
-    if (update.message.text or "") != "➕ Ricarica":
+    msg = update.message.text if update.message else ""
+    if msg != "➕ Ricarica":
         return
     context.user_data.clear()
     context.user_data["pending_step"] = "choose_slot"
@@ -403,17 +393,13 @@ async def on_kwh_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     slot = context.user_data.get("pending_slot")
     bals = get_balances(update.effective_user.id)
-    after_only_this = bals[slot] - kwh
-    pending_tot = sum_pending_for(update.effective_user.id, slot) + kwh  # includo questa
-    after_all_pending = bals[slot] - pending_tot
+    after = bals[slot] - kwh
 
     await update.message.reply_text(
-        "Riepilogo provvisorio:\n"
+        f"Riepilogo provvisorio:\n"
         f"• Slot {slot}\n"
         f"• kWh {fmt_kwh(kwh)}\n"
-        f"Saldo attuale Slot {slot}: {fmt_kwh(bals[slot])}\n"
-        f"→ Dopo QUESTA: {fmt_kwh(after_only_this)} kWh\n"
-        f"→ Dopo TUTTE le PENDING (incl. questa): {fmt_kwh(after_all_pending)} kWh\n"
+        f"Anteprima saldo Slot {slot}: {fmt_kwh(bals[slot])} → {fmt_kwh(after)} kWh.\n"
         "Ora invia la foto della ricarica."
     )
 
@@ -470,7 +456,7 @@ async def on_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["pending_note"] = note
     await finalize_and_send(update, context, qmessage=False)
 
-# Finalizzazione richiesta e invio agli admin
+# Finalizzazione richiesta
 async def finalize_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, qmessage=False):
     u = update.effective_user
     ensure_user(u)
@@ -491,9 +477,7 @@ async def finalize_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     rid = create_recharge(u.id, slot, kwh, file_id, note=note)
     bals = get_balances(u.id)
-    pending_tot = sum_pending_for(u.id, slot)   # include questa appena creata
-    after_only_this = bals[slot] - kwh
-    after_all_pending = bals[slot] - pending_tot
+    after = bals[slot] - kwh
 
     caption = (
         f"Richiesta ricarica\n"
@@ -501,9 +485,7 @@ async def finalize_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         f"Utente: {u.first_name or ''} @{u.username or ''} (id {u.id})\n"
         f"Slot: {slot}\n"
         f"kWh: {fmt_kwh(kwh)}\n"
-        f"Saldo attuale Slot {slot}: {fmt_kwh(bals[slot])}\n"
-        f"→ Dopo QUESTA: {fmt_kwh(after_only_this)} kWh\n"
-        f"→ Dopo TUTTE le PENDING: {fmt_kwh(after_all_pending)} kWh\n"
+        f"Saldo Slot {slot}: {fmt_kwh(bals[slot])} → {fmt_kwh(after)}\n"
     )
     if note:
         caption += f"Nota: {note}\n"
@@ -513,11 +495,11 @@ async def finalize_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, 
          InlineKeyboardButton("Rifiuta",  callback_data=f"reject:{rid}")]
     ])
 
+    # Notifica tutti gli admin
     sent_to_any = False
     for aid in ADMIN_IDS:
         try:
-            msg = await context.bot.send_photo(chat_id=aid, photo=file_id, caption=caption, reply_markup=kb)
-            save_admin_notification(rid, aid, msg.message_id)
+            await context.bot.send_photo(chat_id=aid, photo=file_id, caption=caption, reply_markup=kb)
             sent_to_any = True
         except:
             pass
@@ -546,6 +528,7 @@ async def on_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer(f"Solo gli amministratori possono approvare.\nTu: {q.from_user.id}", show_alert=True)
         return
 
+    # Parse callback
     try:
         action, rid_s = q.data.split(":")
         rid = int(rid_s)
@@ -568,7 +551,7 @@ async def on_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if status != "pending":
         txt = f"Richiesta #{rid} già {status}."
         try:
-            await q.edit_message_caption(txt, reply_markup=None)
+            await q.edit_message_caption(txt)
         except:
             await context.bot.send_message(chat_id=q.message.chat_id, text=txt)
         return
@@ -576,14 +559,9 @@ async def on_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kwh = qk(Decimal(str(kwh_f)))
 
     if action == "approve":
-        # scala saldo (può diventare negativo)
-        add_balance_slot(u_id, slot, -kwh)
+        add_balance_slot(u_id, slot, -kwh)  # può andare in negativo
         set_recharge_status(rid, "approved", q.from_user.id)
         bals = get_balances(u_id)
-
-        # cumulato pending rimasto
-        pending_left = sum_pending_for(u_id, slot)
-        after_all_pending = bals[slot] - pending_left
 
         # Notifica utente
         try:
@@ -591,59 +569,31 @@ async def on_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=u_id,
                 text=(f"Ricarica #{rid} approvata.\n"
                       f"Slot {slot}: −{fmt_kwh(kwh)} kWh.\n"
-                      f"Nuovo saldo Slot {slot}: {fmt_kwh(bals[slot])} kWh.\n"
-                      f"PENDING rimanenti su Slot {slot}: {fmt_kwh(pending_left)} kWh "
-                      f"(saldo stimato dopo tutte: {fmt_kwh(after_all_pending)} kWh).")
+                      f"Nuovo saldo Slot {slot}: {fmt_kwh(bals[slot])} kWh.")
             )
         except:
             pass
 
         admin_txt = (f"Richiesta #{rid} APPROVATA.\n"
-                     f"Utente {u_id} – Slot {slot} −{fmt_kwh(kwh)} kWh → saldo {fmt_kwh(bals[slot])} kWh.\n"
-                     f"PENDING residue su Slot {slot}: {fmt_kwh(pending_left)} kWh "
-                     f"(dopo tutte: {fmt_kwh(after_all_pending)} kWh).")
-
-        # 1) Messaggio dell'admin che ha cliccato
+                     f"Utente {u_id} – Slot {slot} −{fmt_kwh(kwh)} kWh → saldo {fmt_kwh(bals[slot])} kWh.")
         try:
-            await q.edit_message_caption(admin_txt, reply_markup=None)
+            await q.edit_message_caption(admin_txt)
         except:
             await context.bot.send_message(chat_id=q.message.chat_id, text=admin_txt)
-
-        # 2) Aggiorna tutti gli altri messaggi admin (remove buttons)
-        for aid, mid in get_admin_notifications(rid):
-            if aid == q.from_user.id and mid == getattr(q.message, "message_id", None):
-                continue
-            try:
-                await context.bot.edit_message_caption(chat_id=aid, message_id=mid, caption=admin_txt, reply_markup=None)
-            except:
-                try:
-                    await context.bot.send_message(chat_id=aid, text=admin_txt)
-                except:
-                    pass
 
     elif action == "reject":
         set_recharge_status(rid, "rejected", q.from_user.id)
         try:
-            await context.bot.send_message(chat_id=u_id, text=f"Ricarica #{rid} (Slot {slot}) rifiutata dall'amministrazione.")
+            await context.bot.send_message(
+                chat_id=u_id,
+                text=f"Ricarica #{rid} (Slot {slot}) rifiutata dall'amministrazione."
+            )
         except:
             pass
-
-        admin_txt = f"Richiesta #{rid} RIFIUTATA."
         try:
-            await q.edit_message_caption(admin_txt, reply_markup=None)
+            await q.edit_message_caption(f"Richiesta #{rid} RIFIUTATA.")
         except:
-            await context.bot.send_message(chat_id=q.message.chat_id, text=admin_txt)
-
-        for aid, mid in get_admin_notifications(rid):
-            if aid == q.from_user.id and mid == getattr(q.message, "message_id", None):
-                continue
-            try:
-                await context.bot.edit_message_caption(chat_id=aid, message_id=mid, caption=admin_txt, reply_markup=None)
-            except:
-                try:
-                    await context.bot.send_message(chat_id=aid, text=admin_txt)
-                except:
-                    pass
+            await context.bot.send_message(chat_id=q.message.chat_id, text=f"Richiesta #{rid} RIFIUTATA.")
 
 # Admin: accredito manuale
 async def credita(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -677,39 +627,19 @@ async def credita(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Utility
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Il tuo chat_id è: {update.effective_user.id}")
+    u = update.effective_user
+    await update.message.reply_text(f"Il tuo chat_id è: {u.id}")
 
 # Fallback silenzioso
 async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Ignora testi fuori dal flusso per evitare rumore
     pass
 
 # ====== MAIN ======
 def main():
     init_db()
     if not TOKEN or not ADMIN_IDS:
-        raise RuntimeError("Imposta TELEGRAM_TOKEN e ADMIN_IDS (o ADMIN_ID) nel file .env o nelle variabili d'ambiente.")
-
-    # —— PRE-FLIGHT: test connessione e token —— #
-    try:
-        import httpx
-        url = f"https://api.telegram.org/bot{TOKEN}/getMe"
-        r = httpx.get(url, timeout=20.0)
-        if r.status_code == 401:
-            print("❌ ERRORE: Token non valido (401). Rigenera da @BotFather e aggiorna .env")
-            return
-        r.raise_for_status()
-        data = r.json()
-        if not data.get("ok"):
-            print("❌ ERRORE: risposta Telegram non OK:", data)
-            return
-        bot = data.get("result", {})
-        print(f"✅ Connessione OK – Bot: {bot.get('first_name')} (@{bot.get('username')})")
-    except httpx.ConnectTimeout:
-        print("❌ ERRORE: Timeout di connessione a Telegram.\n– Prova altra rete/hotspot\n– Controlla firewall/antivirus (api.telegram.org:443)")
-        return
-    except Exception as e:
-        print("❌ ERRORE di rete/token:", e)
-        return
+        raise RuntimeError("Imposta TELEGRAM_TOKEN e ADMIN_IDS (o ADMIN_ID) nelle variabili d'ambiente o nel file .env.")
 
     app = Application.builder().token(TOKEN).build()
 
@@ -727,7 +657,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(CallbackQueryHandler(on_post_photo_buttons, pattern=r"^flow:(add_note|confirm|cancel)$"))
 
-    # Approvazione utenti
+    # Approvazione utenti (admin)
     app.add_handler(CallbackQueryHandler(on_user_approval, pattern=r"^user:(approve|reject):\d+$"))
 
     # Review ricariche (admin)
