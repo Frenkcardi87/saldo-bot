@@ -1159,12 +1159,7 @@ async def render_pending_card(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.effective_message.reply_text(text, reply_markup=kb)
 
 
-def try:
-    migrate_extra()
-except NameError:
-    pass
-except Exception as _e:
-    print("[WARN] migrate_extra:", _e):
+def migrate_extra():
     with db() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS wallet_requests (
@@ -1182,6 +1177,7 @@ except Exception as _e:
             conn.execute("ALTER TABLE users ADD COLUMN wallet_kwh NUMERIC DEFAULT 0")
         except Exception:
             pass
+
 try:
     migrate_extra()
 except NameError:
