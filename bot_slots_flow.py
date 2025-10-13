@@ -1,8 +1,11 @@
 import os
+import sys
+from typing import Optional
 import sqlite3
 from datetime import datetime
 from contextlib import contextmanager
-from decimal import Decimal, ROUND_DOWN, InvalidOperation
+from decimal import Decimal
+import telegram, ROUND_DOWN, InvalidOperation
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 
@@ -307,7 +310,7 @@ async def guard_approved(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.callback_query.answer("Account in attesa di approvazione.", show_alert=True)
     return False
 
-def main_keyboard(user_id: int | None = None):
+def main_keyboard(user_id: Optional[int] = None):
     return ReplyKeyboardMarkup(
         [[KeyboardButton("➕ Ricarica")],
          [KeyboardButton("/saldo"), KeyboardButton("/annulla")]],
@@ -315,7 +318,7 @@ def main_keyboard(user_id: int | None = None):
     )
 
 
-def slots_keyboard(user_id: int | None = None):
+def slots_keyboard(user_id: Optional[int] = None):
     try:
         b = get_balances(user_id) if user_id is not None else None
     except Exception:
@@ -1078,6 +1081,7 @@ async def on_pending_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---- Rate limit (in-memory) ----
 import time
+from datetime import datetime, timezone, timedelta
 RATE_LIMIT = {}  # {(user_id, key): last_ts}
 def check_rate_limit(user_id: int, key: str, window: int) -> int:
     """
@@ -1155,7 +1159,12 @@ async def render_pending_card(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.effective_message.reply_text(text, reply_markup=kb)
 
 
-def migrate_extra():
+def try:
+    migrate_extra()
+except NameError:
+    pass
+except Exception as _e:
+    print("[WARN] migrate_extra:", _e):
     with db() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS wallet_requests (
@@ -1173,7 +1182,12 @@ def migrate_extra():
             conn.execute("ALTER TABLE users ADD COLUMN wallet_kwh NUMERIC DEFAULT 0")
         except Exception:
             pass
-migrate_extra()
+try:
+    migrate_extra()
+except NameError:
+    pass
+except Exception as _e:
+    print("[WARN] migrate_extra:", _e)
 
 
 async def on_wallet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1277,7 +1291,15 @@ async def on_wallet_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with db() as conn:
             conn.execute("UPDATE wallet_requests SET status='rejected', reviewed_at=datetime('now'), reviewer_id=? WHERE id=?",
                          (q.from_user.id, wid))
-        await q.edit_message_text(f"Richiesta #{wid} rifiutata.")\n            try:\n                with db() as conn:\n                    cur = conn.execute("SELECT user_id FROM wallet_requests WHERE id=?", (wid,))\n                    r = cur.fetchone()\n                if r:\n                    await context.bot.send_message(chat_id=r[0], text="La tua richiesta wallet è stata rifiutata.")\n            except Exception:\n                pass
+        await q.edit_message_text(f"Richiesta #{wid} rifiutata.")
+try:
+    with db() as conn:
+        cur = conn.execute("SELECT user_id FROM wallet_requests WHERE id=?", (wid,))
+        r = cur.fetchone()
+    if r:
+        await context.bot.send_message(chat_id=r[0], text="La tua richiesta wallet è stata rifiutata.")
+except Exception:
+    pass
         return
 
 async def on_message_admin_wallet_kwh(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1304,7 +1326,11 @@ async def on_message_admin_wallet_kwh(update: Update, context: ContextTypes.DEFA
         conn.execute("UPDATE wallet_requests SET status='approved', reviewed_at=datetime('now'), reviewer_id=? WHERE id=?",
                      (update.effective_user.id, wid))
     context.user_data.pop("awaiting_wallet_kwh_for", None)
-    await update.message.reply_text(f"Accreditati {fmt_kwh(kwh)} kWh sul wallet dell'utente {uid}.")\n        try:\n            await context.bot.send_message(chat_id=uid, text=f"La tua richiesta wallet è stata approvata. Accreditati {fmt_kwh(kwh)} kWh.")\n        except Exception:\n            pass
+    await update.message.reply_text(f"Accreditati {fmt_kwh(kwh)} kWh sul wallet dell'utente {uid}.")
+try:
+    await context.bot.send_message(chat_id=uid, text=f"La tua richiesta wallet è stata approvata. Accreditati {fmt_kwh(kwh)} kWh.")
+except Exception:
+    pass
 
 
 
@@ -1443,6 +1469,54 @@ async def on_userdel_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
         conn.execute("DELETE FROM wallet_requests WHERE user_id=?", (uid,))
     await q.edit_message_text(f"Utente {uid} eliminato.")
 
+
+async def startup_notify(app: "Application"):
+    try:
+        # Boot log prints
+        print("[BOOT] saldo-bot avviato ✅")
+        print(f"Python: {sys.version.split()[0]} • PTB: {telegram.__version__}")
+        print(f"DB_PATH: {os.getenv('DB_PATH', 'kwh_slots.db')}")
+        # Count registered handlers (best effort)
+        try:
+            total_handlers = sum(len(h) for h in app.handlers.values())
+        except Exception:
+            total_handlers = 0
+        print(f"Handlers: {total_handlers}")
+        # Telegram notify to admins
+        admins = []
+        if os.getenv("ADMIN_IDS"):
+            admins = [int(x.strip()) for x in os.getenv("ADMIN_IDS").split(",") if x.strip().isdigit()]
+        elif os.getenv("ADMIN_ID"):
+            admins = [int(os.getenv("ADMIN_ID"))]
+        if admins:
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            for aid in admins:
+                try:
+                    await app.bot.send_message(chat_id=aid, text=f"🔔 saldo-bot avviato\n{ts}\nPython {sys.version.split()[0]} • PTB {telegram.__version__}")
+                except Exception as e:
+                    print("[BOOT] notify admin failed:", aid, e)
+    except Exception as e:
+        print("[BOOT] startup_notify error:", e)
+
+
+async def daily_ping(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        admins = []
+        if os.getenv("ADMIN_IDS"):
+            admins = [int(x.strip()) for x in os.getenv("ADMIN_IDS").split(",") if x.strip().isdigit()]
+        elif os.getenv("ADMIN_ID"):
+            admins = [int(os.getenv("ADMIN_ID"))]
+        if not admins:
+            return
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        for aid in admins:
+            try:
+                await context.bot.send_message(chat_id=aid, text=f"🏓 Ping giornaliero: bot attivo\n{ts}")
+            except Exception as e:
+                print("[PING] notify admin failed:", aid, e)
+    except Exception as e:
+        print("[PING] error:", e)
+
 # ==== MAIN ====
 def main():
     init_db()
@@ -1479,6 +1553,11 @@ def main():
     app.add_handler(CommandHandler("annulla", annulla))
     app.add_handler(CommandHandler("credita", credita))
     app.add_handler(CommandHandler("whoami", whoami))
+    # Post-init: send boot notification and print logs
+    try:
+        app.post_init.append(startup_notify)
+    except Exception as _e:
+        print("[BOOT] cannot attach startup_notify:", _e)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message_amount_wallet))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message_admin_wallet_kwh))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message_delete_user))
