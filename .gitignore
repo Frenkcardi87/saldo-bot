@@ -1,5 +1,26 @@
-﻿.venv/
+# Python
 __pycache__/
-*.pyc
-kwh_slots.db
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
 .env
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Logs
+*.log
+
+# SQLite / dati locali (non tenere in git)
+*.db
+
+# Notebook checkpoints (se usi Jupyter)
+.ipynb_checkpoints/
