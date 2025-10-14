@@ -840,7 +840,7 @@ def main():
 
     migrate()
 
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(startup_notify).build()
 
     # Commands
     app.add_handler(CommandHandler("start", start))
@@ -868,7 +868,6 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message_delete_user))
 
     # Post-init hook
-    app.post_init.append(startup_notify)
 
     log.info("Bot in avvio...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
