@@ -1007,6 +1007,58 @@ async def daily_ping(context: ContextTypes.DEFAULT_TYPE):
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("[ERROR] Unhandled exception", exc_info=context.error)
 
+# -------------------- DICHIARAZIONE RICARICA (utente) --------------------
+
+async def on_message_decl_kwh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 1: l'utente inserisce i kWh (numero positivo)."""
+    if not context.user_data.get("decl_await_kwh"):
+        return
+    txt = (update.message.text or "").replace(",", ".").strip()
+    try:
+        kwh = Decimal(txt)
+        if kwh <= 0:
+            raise ValueError
+    except Exception:
+        await update.message.reply_text("Valore non valido. Inserisci un numero positivo (es. 12.5).")
+        return
+
+    context.user_data["decl_kwh"] = kwh
+    context.user_data["decl_await_kwh"] = False
+    context.user_data["decl_await_photo"] = True
+    await update.message.reply_text("Ok 👍\nOra invia **una foto** della ricevuta (obbligatoria).")
+
+async def on_message_decl_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2: l'utente manda la foto; proponi 'Aggiungi nota' o 'Procedi senza nota'."""
+    if not context.user_data.get("decl_await_photo"):
+        return
+    if not update.message.photo:
+        await update.message.reply_text("Devi inviare **una foto** della ricevuta.")
+        return
+
+    file_id = update.message.photo[-1].file_id
+    context.user_data["decl_photo_id"] = file_id
+    context.user_data["decl_await_photo"] = False
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Aggiungi nota", callback_data="decl:addnote")],
+        [InlineKeyboardButton("➡️ Procedi senza nota", callback_data="decl:choose")],
+    ])
+    await update.message.reply_text(
+        "Foto ricevuta 📷\nVuoi aggiungere una nota o procedere?",
+        reply_markup=kb
+    )
+
+async def on_message_decl_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 3 (opzionale): l'utente scrive la nota; poi si passa alla scelta dello slot."""
+    if not context.user_data.get("decl_await_note"):
+        return
+    note = (update.message.text or "").strip()
+    context.user_data["decl_note"] = "" if note.lower() == "ok" else note
+    context.user_data["decl_await_note"] = False
+    # mostra scelta slot
+    await _send_slot_choice(update, context, via_callback=False)
+
+
 # -------------------- FACTORY --------------------
 def create_application() -> Application:
     if not TOKEN:
