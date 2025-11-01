@@ -1,25 +1,36 @@
-# serve_bot.py
-import threading
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+FastAPI minimale per healthcheck + bootstrap del bot come *web service*.
+Avvia il bot in background su import. Adatto a Railway/Render.
+"""
 import asyncio
+import threading
 from fastapi import FastAPI
-from bot_slots_flow import create_application
-from telegram import Update
 
-app = FastAPI(title="saldo-bot")
+from bot_slots_flow import build_application
 
-_bot_thread = None
+app = FastAPI()
 
-def _run_bot():
-    application = create_application()
-    asyncio.run(application.run_polling(allowed_updates=Update.ALL_TYPES))
+# Avvio bot in background (thread dedicato)
+_bot_started = False
+
+
+def _start_bot():
+    global _bot_started
+    if _bot_started:
+        return
+    _bot_started = True
+    application = build_application()
+    # usa long polling in thread separato
+    threading.Thread(target=lambda: application.run_polling(close_loop=False), daemon=True).start()
+
 
 @app.on_event("startup")
-def on_startup():
-    global _bot_thread
-    if _bot_thread is None:
-        _bot_thread = threading.Thread(target=_run_bot, daemon=True)
-        _bot_thread.start()
+async def on_startup():
+    _start_bot()
+
 
 @app.get("/")
-def root():
-    return {"status": "ok"}
+async def root():
+    return {"status": "ok", "service": "saldo-bot"}
