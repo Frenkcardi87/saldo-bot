@@ -225,37 +225,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Ciao! 👋", reply_markup=main_keyboard(update.effective_user.id))
 
 async def saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_user(update.effective_user)
-    # Admin query: /saldo <target>
-    if is_admin(update.effective_user.id):
-        parts = (update.message.text or "").strip().split(maxsplit=1)
-        if len(parts) == 2 and parts[0].lower() == "/saldo":
+    user = update.effective_user
+    if not user:
+        return
+    ensure_user(user)
+    uid = user.id
+
+    # Admin: /saldo <utente>
+    target_uid = uid
+    if is_admin(uid) and update.message and update.message.text:
+        parts = update.message.text.strip().split(maxsplit=1)
+        if len(parts) == 2 and parts[0].lower().startswith("/saldo"):
             target = resolve_user_identifier(parts[1])
             if isinstance(target, list):
                 await ask_user_pick(update, target, "saldo")
                 return
             elif isinstance(target, int):
-                uid = target
-            else:
-                uid = update.effective_user.id
-        else:
-            uid = update.effective_user.id
-    else:
-        uid = update.effective_user.id
+                target_uid = target
 
-    balances = get_balances(uid)
-    wallet = get_wallet_kwh(uid)
-    txt = [
-        f"👤 Utente: {uid}" + (" (admin)" if is_admin(uid) else ""),
-        "",
-        "🔌 Slot:",
-        f"• 8 kW: {fmt_kwh(balances[8])} kWh",
-        f"• 3 kW: {fmt_kwh(balances[3])} kWh",
-        f"• 5 kW: {fmt_kwh(balances[5])} kWh",
-        "",
-        f"👛 Wallet: {fmt_kwh(wallet)} kWh",
-    ]
-    await update.message.reply_text("\n".join(txt), reply_markup=main_keyboard(update.effective_user.id))
+    balances = get_balances(target_uid)
+    wallet = get_wallet_kwh(target_uid)
+    txt = (
+        f"📊 *Saldo attuale* (utente {target_uid})\n"
+        f"• 8 kW: {fmt_kwh(balances[8])} kWh\n"
+        f"• 3 kW: {fmt_kwh(balances[3])} kWh\n"
+        f"• 5 kW: {fmt_kwh(balances[5])} kWh\n\n"
+        f"👛 Wallet: {fmt_kwh(wallet)} kWh"
+    )
+    await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=main_keyboard(uid))
+
 
 # -------------------- MENU CALLBACKS --------------------
 async def on_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -562,6 +560,8 @@ async def on_wallet_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("Solo admin", show_alert=True); return
 
     data = q.data
+
+    # Navigazione carte
     if data.startswith("wallet:nav:"):
         direction = data.split(":")[-1]
         idx = int(context.user_data.get("wallet_idx", 0))
@@ -569,12 +569,14 @@ async def on_wallet_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await render_wallet_card(update, context, idx)
         return
 
+    # ACCETTA → chiedo i kWh da accreditare
     if data.startswith("wallet:accept:"):
         wid = int(data.split(":")[-1])
         context.user_data["awaiting_wallet_kwh_for"] = wid
         await q.edit_message_text(f"Inserisci i kWh da accreditare per richiesta #{wid}.")
         return
 
+    # RIFIUTA → chiude la richiesta
     if data.startswith("wallet:reject:"):
         wid = int(data.split(":")[-1])
         with db() as conn:
@@ -583,20 +585,15 @@ async def on_wallet_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (q.from_user.id, wid),
             )
         await q.edit_message_text(f"Richiesta #{wid} rifiutata.")
-        try:
-            with db() as conn:
-                cur = conn.execute("SELECT user_id FROM wallet_requests WHERE id=?", (wid,))
-                r = cur.fetchone()
-            if r:
-                await context.bot.send_message(chat_id=r[0], text="La tua richiesta wallet è stata rifiutata.")
-        except Exception:
-            pass
+        # (notifica utente…)
         return
+
 
 async def on_message_admin_wallet_kwh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wid = context.user_data.get("awaiting_wallet_kwh_for")
     if not wid:
-        return
+        return  # nessuna richiesta in attesa di valore → ignora
+
     txt = (update.message.text or "").replace(",", ".").strip()
     try:
         kwh = Decimal(txt)
@@ -606,7 +603,10 @@ async def on_message_admin_wallet_kwh(update: Update, context: ContextTypes.DEFA
         await update.message.reply_text("Valore non valido. Inserisci kWh positivi (es. 15 o 12.5).")
         return
 
+    # chiudo lo stato
     context.user_data["awaiting_wallet_kwh_for"] = None
+
+    # aggiorno DB: +kWh a wallet utente e stato=approved
     with db() as conn:
         cur = conn.execute("SELECT user_id FROM wallet_requests WHERE id=?", (wid,))
         r = cur.fetchone()
@@ -622,17 +622,31 @@ async def on_message_admin_wallet_kwh(update: Update, context: ContextTypes.DEFA
     except Exception:
         pass
 
+
 # -------------------- DICHIARAZIONE RICARICA (utente) --------------------
 async def on_decl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
+
     if q.data == "decl:start":
         context.user_data["decl_await_kwh"] = True
         context.user_data["decl_kwh"] = None
         context.user_data["decl_photo_id"] = None
         context.user_data["decl_note"] = ""
         await q.edit_message_text("Inserisci i kWh ricaricati (es. 12.5):")
+        return
+
+    if q.data == "decl:addnote":
+        # abilita l'inserimento della nota
+        context.user_data["decl_await_note"] = True
+        await q.edit_message_text("Aggiungi una **nota** (opzionale) e invia. Oppure scrivi *ok* per nessuna nota.", parse_mode="Markdown")
+        return
+
+    if q.data == "decl:choose":
+        # nessuna nota: vai subito alla scelta slot
+        context.user_data["decl_note"] = ""
+        await _send_slot_choice(update, context, via_callback=True)
         return
 
     if q.data.startswith("decl:slot:"):
@@ -647,11 +661,15 @@ async def on_decl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with db() as conn:
             conn.execute(
                 "INSERT INTO recharges (user_id, slot, kwh, status, note, photo_file_id) VALUES (?,?,?,?,?,?)",
-                (uid, slot, str(context.user_data.get("decl_kwh")), "pending", context.user_data.get("decl_note",""), context.user_data.get("decl_photo_id"))
+                (uid, slot, str(context.user_data.get("decl_kwh")),
+                 "pending", context.user_data.get("decl_note",""),
+                 context.user_data.get("decl_photo_id"))
             )
-            cur = conn.execute("SELECT last_insert_rowid()"); rid = cur.fetchone()[0]
+            cur = conn.execute("SELECT last_insert_rowid()")
+            rid = cur.fetchone()[0]
 
         await q.edit_message_text(f"Ricarica inviata ✅ (id #{rid}). Gli admin la valuteranno.")
+
         # notifica admin
         if ADMIN_IDS:
             kb = InlineKeyboardMarkup([
@@ -663,36 +681,49 @@ async def on_decl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await context.bot.send_message(
                         chat_id=aid,
-                        text=f"📝 Nuova ricarica dichiarata #{rid}\nUtente: {uid}\nSlot: {slot}\nKWh: {fmt_kwh(context.user_data['decl_kwh'])}"
-                             + (f"\nNota: {context.user_data.get('decl_note')}" if context.user_data.get("decl_note") else ""),
+                        text=(f"📝 Nuova ricarica dichiarata #{rid}\n"
+                              f"Utente: {uid}\nSlot: {slot}\nKWh: {fmt_kwh(context.user_data['decl_kwh'])}"
+                              + (f"\nNota: {context.user_data.get('decl_note')}" if context.user_data.get("decl_note") else "")),
                         reply_markup=kb
                     )
                     if photo_id:
                         await context.bot.send_photo(chat_id=aid, photo=photo_id, caption=f"Ricevuta ricarica #{rid}")
                 except Exception as e:
                     log.warning("Notify admin recharge failed %s: %s", aid, e)
+
         # pulizia stato
         context.user_data["decl_kwh"] = None
         context.user_data["decl_photo_id"] = None
         context.user_data["decl_note"] = ""
+        context.user_data["decl_await_kwh"] = False
+        context.user_data["decl_await_photo"] = False
+        context.user_data["decl_await_note"] = False
         return
 
-async def on_message_decl_kwh(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("decl_await_kwh"):
+async def on_message_decl_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("decl_await_note"):
         return
-    txt = (update.message.text or "").replace(",", ".").strip()
-    try:
-        kwh = Decimal(txt)
-        if kwh <= 0:
-            raise ValueError
-    except Exception:
-        await update.message.reply_text("Valore non valido. Inserisci un numero positivo (es. 12.5).")
-        return
+    note = (update.message.text or "").strip()
+    context.user_data["decl_note"] = "" if note.lower() == "ok" else note
+    context.user_data["decl_await_note"] = False
+    await _send_slot_choice(update, context, via_callback=False)
 
-    context.user_data["decl_kwh"] = kwh
-    context.user_data["decl_await_kwh"] = False
-    context.user_data["decl_await_photo"] = True
-    await update.message.reply_text("Ok 👍\nOra invia **una foto** della ricevuta (obbligatoria).")
+async def _send_slot_choice(update: Update, context: ContextTypes.DEFAULT_TYPE, via_callback: bool):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("8 kW", callback_data="decl:slot:8"),
+         InlineKeyboardButton("3 kW", callback_data="decl:slot:3"),
+         InlineKeyboardButton("5 kW", callback_data="decl:slot:5")],
+    ])
+    msg = (
+        f"Conferma:\nKWh: {fmt_kwh(context.user_data['decl_kwh'])}"
+        + (f"\nNota: {context.user_data['decl_note']}" if context.user_data.get('decl_note') else "")
+        + "\n\nSeleziona lo *slot*:"
+    )
+    if via_callback and update.callback_query:
+        await update.callback_query.edit_message_text(msg, reply_markup=kb, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(msg, reply_markup=kb, parse_mode="Markdown")
+
 
 async def on_message_decl_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("decl_await_photo"):
@@ -700,11 +731,20 @@ async def on_message_decl_photo(update: Update, context: ContextTypes.DEFAULT_TY
     if not update.message.photo:
         await update.message.reply_text("Devi inviare **una foto** della ricevuta.")
         return
+
     file_id = update.message.photo[-1].file_id
     context.user_data["decl_photo_id"] = file_id
     context.user_data["decl_await_photo"] = False
-    context.user_data["decl_await_note"] = True
-    await update.message.reply_text("Foto ricevuta 📷\nAggiungi una **nota** (opzionale), oppure scrivi **ok** per inviare.")
+
+    # Offri due scelte: aggiungere nota oppure procedere direttamente alla scelta dello slot
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Aggiungi nota", callback_data="decl:addnote")],
+        [InlineKeyboardButton("➡️ Procedi senza nota", callback_data="decl:choose")],
+    ])
+    await update.message.reply_text(
+        "Foto ricevuta 📷\nVuoi aggiungere una nota o procedere?",
+        reply_markup=kb
+    )
 
 async def on_message_decl_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("decl_await_note"):
