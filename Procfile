@@ -1,1 +1,1 @@
-worker: python -u bot_slots_flow.py
+web: uvicorn serve_bot:app --host 0.0.0.0 --port $PORT
