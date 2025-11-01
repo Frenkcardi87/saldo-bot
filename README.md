@@ -202,3 +202,16 @@ Ping giornaliero duplicato**:** non avviare più istanze del worker
 📄 Licenza
 
 Progetto interno. Tutti i diritti riservati (o inserisci la tua licenza).
+
+## Environment (Railway / locale)
+
+Imposta le seguenti variabili d'ambiente:
+
+- `TELEGRAM_TOKEN` – token del bot da @BotFather
+- `ADMIN_IDS` – lista di ID admin separati da virgola o spazio (es: `123456,987654321`)
+- `DB_PATH` – (opzionale) percorso SQLite; su Railway con Volume: `/data/kwh_slots.db`
+- `ALLOW_NEGATIVE` – (opzionale) `1/true/yes` per abilitare saldo negativo
+
+### Esecuzione locale (facoltativo)
+Puoi creare un file `.env` **non versionato** con le stesse chiavi.
+
