@@ -23,8 +23,9 @@ import sys
 import sqlite3
 import logging
 import time
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, List, Tuple
 from decimal import Decimal, ROUND_HALF_UP
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
 import telegram
@@ -42,7 +43,7 @@ from telegram.ext import (
     filters,
 )
 
-# -------------------- CONFIG --------------------
+# ---- CONFIG --------------------
 
 TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 DB_PATH = os.getenv("DB_PATH", "kwh_slots.db")
@@ -59,10 +60,14 @@ log = logging.getLogger("saldo-bot")
 
 # -------------------- DB --------------------
 
+@contextmanager
 def db():
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 def migrate():
     with db() as conn:
@@ -98,33 +103,35 @@ def migrate():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 amount_eur NUMERIC NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending', -- pending/approved/rejected
-                note TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
                 created_at TEXT DEFAULT (datetime('now')),
                 reviewed_at TEXT,
                 reviewer_id INTEGER
             );
+
+            CREATE INDEX IF NOT EXISTS ix_recharges_status ON recharges(status);
+            CREATE INDEX IF NOT EXISTS ix_wallet_status ON wallet_requests(status);
             """
         )
+
+# -------------------- UTILS --------------------
+
+def is_admin(user_id: int) -> bool:
+    return int(user_id) in ADMIN_IDS
 
 def ensure_user(u: telegram.User):
     with db() as conn:
         conn.execute(
             """
             INSERT INTO users (user_id, username, first_name, last_name, approved)
-            VALUES (?, ?, ?, ?, COALESCE((SELECT approved FROM users WHERE user_id=?), 0))
+            VALUES (?, ?, ?, ?, COALESCE(?, 0))
             ON CONFLICT(user_id) DO UPDATE SET
                 username=excluded.username,
                 first_name=excluded.first_name,
                 last_name=excluded.last_name
             """,
-            (u.id, u.username, u.first_name, u.last_name, u.id),
+            (u.id, u.username, u.first_name, u.last_name, 1 if is_admin(u.id) else 0),
         )
-
-# -------------------- HELPERS --------------------
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
 
 def fmt_kwh(x: Decimal | float | int | str) -> str:
     d = Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -156,69 +163,44 @@ def resolve_user_identifier(q: str):
     q = (q or "").strip()
     if not q:
         return None
-    try:
+    if q.startswith("@"):
+        with db() as conn:
+            cur = conn.execute("SELECT user_id, username, first_name, last_name FROM users WHERE username=?", (q[1:],))
+            r = cur.fetchone()
+        return int(r[0]) if r else None
+    if q.isdigit():
         return int(q)
-    except Exception:
-        pass
-    uname = q[1:] if q.startswith("@") else q
+    # partial name search
     with db() as conn:
-        cur = conn.execute("SELECT user_id, username, first_name, last_name FROM users WHERE LOWER(username)=LOWER(?)", (uname,))
-        row = cur.fetchone()
-        if row:
-            return row[0]
-        like = f"%{q}%"
         cur = conn.execute(
             """
-            SELECT user_id, COALESCE(username,''), COALESCE(first_name,''), COALESCE(last_name,'')
+            SELECT user_id, username, first_name, last_name
             FROM users
-            WHERE (IFNULL(username,'') LIKE ? OR IFNULL(first_name,'') LIKE ? OR IFNULL(last_name,'') LIKE ?)
-            ORDER BY user_id ASC
-            LIMIT 10
+            WHERE (first_name || ' ' || COALESCE(last_name,'')) LIKE ? OR COALESCE(username,'') LIKE ?
+            ORDER BY created_at DESC
+            LIMIT 20
             """,
-            (like, like, like),
+            (f"%{q}%", f"%{q}%"),
         )
         rows = cur.fetchall()
     if not rows:
         return None
     if len(rows) == 1:
-        return rows[0][0]
-    return [(r[0], r[1], r[2], r[3]) for r in rows]
+        return int(rows[0][0])
+    return rows  # multiple
 
-# Rate limit (user_id, key) -> timestamp
-RATE_LIMIT: Dict[Tuple[int,str], int] = {}
-def check_rate_limit(user_id: int, key: str, window: int) -> int:
-    now = int(time.time())
-    last = RATE_LIMIT.get((user_id, key), 0)
-    if now - last < window:
-        return window - (now - last)
-    RATE_LIMIT[(user_id, key)] = now
-    return 0
-
-# -------------------- KEYBOARDS --------------------
-
-def main_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
-    wlabel = "💳 Ricarica wallet"
-    isadm = False
-    if user_id is not None:
-        try:
-            wlabel = f"💳 Wallet • {fmt_kwh(get_wallet_kwh(user_id))} kWh"
-        except Exception:
-            pass
-        isadm = is_admin(user_id)
-
-    buttons = [
-        [InlineKeyboardButton("📊 Saldo", callback_data="menu:saldo")],
-        [InlineKeyboardButton("📝 Dichiara ricarica", callback_data="decl:start")],
-        [InlineKeyboardButton(wlabel, callback_data="wallet:req")],
-        [InlineKeyboardButton("ℹ️ Help", callback_data="menu:help")],
+def main_keyboard(uid: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("📊 Saldo", callback_data="menu:saldo"),
+         InlineKeyboardButton("📝 Dichiara ricarica", callback_data="decl:start")],
+        [InlineKeyboardButton("💳 Wallet", callback_data="wallet:req"),
+         InlineKeyboardButton("ℹ️ Help", callback_data="menu:help")],
     ]
-    if isadm:
-        buttons += [
-            [InlineKeyboardButton("🧾 Pending", callback_data="menu:pending"),
-             InlineKeyboardButton("👛 Wallet pending", callback_data="menu:walletpending")],
-            [InlineKeyboardButton("👥 Utenti", callback_data="menu:utenti")],
-        ]
-    return InlineKeyboardMarkup(buttons)
+    if is_admin(uid):
+        rows.append([InlineKeyboardButton("🧾 Pending", callback_data="menu:pending"),
+                     InlineKeyboardButton("👛 Wallet pending", callback_data="menu:walletpending")])
+        rows.append([InlineKeyboardButton("👥 Utenti", callback_data="menu:utenti")])
+    return InlineKeyboardMarkup(rows)
 
 # -------------------- COMMANDS --------------------
 
@@ -253,68 +235,65 @@ async def saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = (update.message.text or "").strip().split(maxsplit=1)
         if len(parts) == 2 and parts[0].lower() == "/saldo":
             target = resolve_user_identifier(parts[1])
-            if target is None:
-                await update.message.reply_text("Utente non trovato.")
-                return
             if isinstance(target, list):
-                await ask_user_pick(update, target, "saldo"); return
-            oid = int(target)
-            b = get_balances(oid)
-            w = get_wallet_kwh(oid)
-            await update.message.reply_text(
-                "Saldi utente {oid}:\n"
-                f"• Slot 8: {fmt_kwh(b[8])} kWh\n"
-                f"• Slot 3: {fmt_kwh(b[3])} kWh\n"
-                f"• Slot 5: {fmt_kwh(b[5])} kWh\n"
-                f"• Wallet: {fmt_kwh(w)} kWh".format(oid=oid),
-                reply_markup=main_keyboard(update.effective_user.id)
-            )
-            return
-    # Self
-    u = update.effective_user
-    b = get_balances(u.id)
-    w = get_wallet_kwh(u.id)
-    await update.message.reply_text(
-        "I tuoi saldi:\n"
-        f"• Slot 8: {fmt_kwh(b[8])} kWh\n"
-        f"• Slot 3: {fmt_kwh(b[3])} kWh\n"
-        f"• Slot 5: {fmt_kwh(b[5])} kWh\n"
-        f"• Wallet: {fmt_kwh(w)} kWh",
-        reply_markup=main_keyboard(u.id)
-    )
+                # multiple matches → ask to pick
+                await ask_user_pick(update, target, "saldo")
+                return
+            elif isinstance(target, int):
+                uid = target
+            else:
+                uid = update.effective_user.id
+        else:
+            uid = update.effective_user.id
+    else:
+        uid = update.effective_user.id
 
-# -------------------- MENU CALLBACK --------------------
+    balances = get_balances(uid)
+    wallet = get_wallet_kwh(uid)
+    txt = [
+        f"👤 Utente: {uid}" + (" (admin)" if is_admin(uid) else ""),
+        "",
+        "🔌 Slot:",
+        f"• 8 kW: {fmt_kwh(balances[8])} kWh",
+        f"• 3 kW: {fmt_kwh(balances[3])} kWh",
+        f"• 5 kW: {fmt_kwh(balances[5])} kWh",
+        "",
+        f"👛 Wallet: {fmt_kwh(wallet)} kWh",
+    ]
+    await update.message.reply_text("\n".join(txt), reply_markup=main_keyboard(update.effective_user.id))
+
+# -------------------- MENU CALLBACKS --------------------
 
 async def on_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    ensure_user(q.from_user)  # evita lookup mancanti
     uid = q.from_user.id
-    data = q.data
 
+    data = q.data
     if data == "menu:saldo":
-        b = get_balances(uid)
-        w = get_wallet_kwh(uid)
-        txt = (
-            "I tuoi saldi:\n"
-            f"• Slot 8: {fmt_kwh(b[8])} kWh\n"
-            f"• Slot 3: {fmt_kwh(b[3])} kWh\n"
-            f"• Slot 5: {fmt_kwh(b[5])} kWh\n"
-            f"• Wallet: {fmt_kwh(w)} kWh"
+        balances = get_balances(uid); wallet = get_wallet_kwh(uid)
+        await q.edit_message_text(
+            "📊 *Saldo attuale*\n"
+            f"• 8 kW: {fmt_kwh(balances[8])} kWh\n"
+            f"• 3 kW: {fmt_kwh(balances[3])} kWh\n"
+            f"• 5 kW: {fmt_kwh(balances[5])} kWh\n\n"
+            f"👛 Wallet: {fmt_kwh(wallet)} kWh",
+            reply_markup=main_keyboard(uid), parse_mode="Markdown"
         )
-        await q.edit_message_text(txt, reply_markup=main_keyboard(uid))
         return
 
     if data == "menu:pending":
         if not is_admin(uid):
             await q.answer("Solo admin", show_alert=True); return
-        await pending(Update.de_json(q.to_dict(), context.application.bot), context)
+        dummy = Update.de_json(q.to_dict(), context.application.bot)
+        await pending(dummy, context)
         return
 
     if data == "menu:walletpending":
         if not is_admin(uid):
             await q.answer("Solo admin", show_alert=True); return
-        await wallet_pending(Update.de_json(q.to_dict(), context.application.bot), context)
+        dummy = Update.de_json(q.to_dict(), context.application.bot)
+        await wallet_pending(dummy, context)
         return
 
     if data == "menu:utenti":
@@ -347,48 +326,50 @@ async def render_pending_card(update: Update, context: ContextTypes.DEFAULT_TYPE
         msg = "Nessuna ricarica in attesa."
         if update.callback_query:
             await update.callback_query.edit_message_text(msg); return
-        await update.message.reply_text(msg); return
+        else:
+            await update.message.reply_text(msg); return
     idx = max(0, min(idx, len(ids)-1))
-    context.user_data["pending_idx"] = idx
     rid = ids[idx]
+    context.user_data["pending_idx"] = idx
+
     with db() as conn:
-        cur = conn.execute(
-            """
-            SELECT r.id, r.user_id, r.slot, r.kwh, r.status, COALESCE(r.created_at,''), COALESCE(r.note,''),
-                   COALESCE(r.photo_file_id,''), COALESCE(u.username,''), COALESCE(u.first_name,''), COALESCE(u.last_name,'')
-            FROM recharges r
-            LEFT JOIN users u ON u.user_id = r.user_id
-            WHERE r.id = ?
-            """,
-            (rid,)
-        )
-        row = cur.fetchone()
-    if not row:
-        await update.effective_message.reply_text(f"Ricarica #{rid} non trovata."); return
-    (_rid, uid, slot, kwh, status, created_at, note, photo_id, username, fn, ln) = row
-    who = f"@{username}" if username else ((fn or "") + (" " + ln if ln else "")).strip() or str(uid)
-    created_fmt = (created_at or "-").replace("T"," ")[:19]
-    text = (
-        f"[{idx+1}/{len(ids)}] Ricarica #{_rid} • {created_fmt}\n"
-        f"Utente: {who} (id {uid})\n"
-        f"Slot: {slot} • Richiesta: {fmt_kwh(Decimal(str(kwh)))} kWh\n"
-        + (f"Nota: {note}" if note else "")
-    ).strip()
+        cur = conn.execute("SELECT id, user_id, slot, kwh, status, note, photo_file_id, created_at FROM recharges WHERE id=?", (rid,))
+        r = cur.fetchone()
+    if not r:
+        await update.message.reply_text("Elemento non trovato."); return
+
+    rid, uid, slot, kwh, status, note, photo, created = r
+    caption = (
+        f"🧾 Ricarica #{rid}\n"
+        f"Utente: {uid}\n"
+        f"Slot: {slot}\n"
+        f"KWh: {fmt_kwh(kwh)}\n"
+        f"Stato: {status}\n"
+        f"Data: {created}\n"
+        + (f"Nota: {note}\n" if note else "")
+    )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️", callback_data="pending:nav:prev"),
-         InlineKeyboardButton("➡️", callback_data="pending:nav:next")],
-        [InlineKeyboardButton("📷 Foto", callback_data=f"pending:photo:{_rid}"),
-         InlineKeyboardButton("ℹ️ Dettagli", callback_data=f"pending:info:{_rid}")],
-        [InlineKeyboardButton("✅ Approva", callback_data=f"approve:{_rid}"),
-         InlineKeyboardButton("❌ Rifiuta", callback_data=f"reject:{_rid}")],
+        [InlineKeyboardButton("⬅️ Prev", callback_data="pending:nav:prev"),
+         InlineKeyboardButton("➡️ Next", callback_data="pending:nav:next")],
+        [InlineKeyboardButton("📸 Foto", callback_data=f"pending:photo:{rid}"),
+         InlineKeyboardButton("ℹ️ Info", callback_data=f"pending:info:{rid}")],
+        [InlineKeyboardButton("✅ Approva", callback_data=f"approve:{rid}"),
+         InlineKeyboardButton("❌ Rifiuta", callback_data=f"reject:{rid}")],
     ])
+
     if update.callback_query:
         try:
-            await update.callback_query.edit_message_text(text, reply_markup=kb)
+            if photo:
+                await update.callback_query.edit_message_caption(caption=caption, reply_markup=kb)
+            else:
+                await update.callback_query.edit_message_text(caption, reply_markup=kb)
         except Exception:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=kb)
+            await update.callback_query.edit_message_text(caption, reply_markup=kb)
     else:
-        await update.message.reply_text(text, reply_markup=kb)
+        if photo:
+            await update.message.reply_photo(photo=photo, caption=caption, reply_markup=kb)
+        else:
+            await update.message.reply_text(caption, reply_markup=kb)
 
 async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -422,59 +403,29 @@ async def on_pending_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await q.answer("Callback non valida", show_alert=True); return
 
-    with db() as conn:
-        cur = conn.execute(
-            """
-            SELECT r.id, r.user_id, r.slot, r.kwh, r.status, COALESCE(r.created_at,''),
-                   COALESCE(r.reviewed_at,''), COALESCE(r.reviewer_id,''), COALESCE(r.note,''), COALESCE(r.photo_file_id,''),
-                   COALESCE(u.username,''), COALESCE(u.first_name,''), COALESCE(u.last_name,'')
-            FROM recharges r
-            LEFT JOIN users u ON u.user_id = r.user_id
-            WHERE r.id = ?
-            """,
-            (rid,)
-        )
-        row = cur.fetchone()
-    if not row:
-        await q.edit_message_text("Ricarica non trovata (forse già gestita)."); return
-    (_rid, uid, slot, kwh, status, created_at, reviewed_at, reviewer_id, note, photo_id, username, fn, ln) = row
-
     if kind == "photo":
-        if photo_id:
-            await context.bot.send_photo(chat_id=q.message.chat.id, photo=photo_id, caption=f"#{rid} – slot {slot}, {fmt_kwh(Decimal(str(kwh)))} kWh")
-        else:
-            await q.answer("Nessuna foto.", show_alert=True)
+        with db() as conn:
+            cur = conn.execute("SELECT photo_file_id FROM recharges WHERE id=?", (rid,))
+            r = cur.fetchone()
+        if not r or not r[0]:
+            await q.answer("Nessuna foto", show_alert=True); return
+        await context.bot.send_photo(chat_id=q.message.chat_id, photo=r[0], caption=f"Foto ricarica #{rid}")
         return
+
     if kind == "info":
-        who = f"@{username}" if username else ((fn or "") + (" " + ln if ln else "")).strip() or str(uid)
-        created_fmt = (created_at or "-").replace("T"," ")[:19]
-        reviewed_fmt = (reviewed_at or "-").replace("T"," ")[:19]
-        info = [
-            f"Ricarica #{rid}",
-            f"Utente: {who} (id {uid})",
-            f"Slot: {slot}",
-            f"kWh richiesti: {fmt_kwh(Decimal(str(kwh)))}",
-            f"Stato: {status}",
-            f"Creata: {created_fmt}",
-            f"Revisionata: {reviewed_fmt}",
-        ]
-        if reviewer_id:
-            info.append(f"Revisore: {reviewer_id}")
-        if note:
-            info.append(f"Nota: {note}")
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📷 Foto", callback_data=f"pending:photo:{rid}")],
-            [InlineKeyboardButton("✅ Approva", callback_data=f"approve:{rid}"),
-             InlineKeyboardButton("❌ Rifiuta", callback_data=f"reject:{rid}")],
-        ])
-        try:
-            await q.edit_message_text("\n".join(info), reply_markup=kb)
-        except Exception:
-            await context.bot.send_message(chat_id=q.message.chat.id, text="\n".join(info), reply_markup=kb)
+        with db() as conn:
+            cur = conn.execute("SELECT id, user_id, slot, kwh, status, note, created_at FROM recharges WHERE id=?", (rid,))
+            r = cur.fetchone()
+        if not r:
+            await q.edit_message_text("Ricarica non trovata."); return
+        _id, uid, slot, kwh, status, note, created = r
+        await q.edit_message_text(
+            f"🧾 Ricarica #{_id}\nUtente: {uid}\nSlot: {slot}\nKWh: {fmt_kwh(kwh)}\nStato: {status}\nData: {created}"
+            + (f"\nNota: {note}" if note else "")
+        )
         return
 
-# -------------------- APPROVE/REJECT RICARICHE (callback diretti) --------------------
-
+# Approva / Rifiuta
 async def on_recharge_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -509,37 +460,32 @@ async def on_recharge_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 (q.from_user.id, rid)
             )
             msg = f"✅ Ricarica #{rid} approvata. Accreditati {fmt_kwh(kwh)} kWh su slot {slot}."
-            await q.edit_message_text(msg)
-            try:
-                await context.bot.send_message(chat_id=uid, text=f"La tua ricarica #{rid} è stata approvata: {fmt_kwh(kwh)} kWh su slot {slot}.")
-            except Exception:
-                pass
-            return
-
-        if action == "reject":
+        else:
             conn.execute(
                 "UPDATE recharges SET status='rejected', reviewed_at=datetime('now'), reviewer_id=? WHERE id=?",
                 (q.from_user.id, rid)
             )
-            await q.edit_message_text(f"❌ Ricarica #{rid} rifiutata.")
-            try:
-                await context.bot.send_message(chat_id=uid, text=f"La tua ricarica #{rid} è stata rifiutata.")
-            except Exception:
-                pass
-            return
+            msg = f"❌ Ricarica #{rid} rifiutata."
 
-# -------------------- WALLET REQUEST FLOW --------------------
+    await q.edit_message_text(msg)
+    # avvisa utente
+    try:
+        await context.bot.send_message(chat_id=uid, text=msg)
+    except Exception:
+        pass
+
+# -------------------- WALLET --------------------
 
 async def on_wallet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    ensure_user(q.from_user)
     if q.data == "wallet:req":
-        context.user_data["awaiting_wallet_amount_eur"] = True
-        await q.edit_message_text("Inserisci l'importo in € (es. 15.50).")
+        context.user_data["awaiting_wallet_amount"] = True
+        await q.edit_message_text("Inserisci l'importo € per ricaricare il wallet (es. 20 o 20.5):")
+        return
 
 async def on_message_amount_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_wallet_amount_eur"):
+    if not context.user_data.get("awaiting_wallet_amount"):
         return
     txt = (update.message.text or "").replace(",", ".").strip()
     try:
@@ -547,15 +493,16 @@ async def on_message_amount_wallet(update: Update, context: ContextTypes.DEFAULT
         if amt <= 0:
             raise ValueError
     except Exception:
-        await update.message.reply_text("Importo non valido. Inserisci un numero positivo, es. 10 o 12.50")
+        await update.message.reply_text("Importo non valido. Inserisci un numero positivo (es. 12.5).")
         return
-    # crea richiesta
+
+    context.user_data["awaiting_wallet_amount"] = False
     with db() as conn:
-        conn.execute("INSERT INTO wallet_requests (user_id, amount_eur, status) VALUES (?,?, 'pending')", (update.effective_user.id, str(amt)))
+        conn.execute("INSERT INTO wallet_requests (user_id, amount_eur) VALUES (?,?)", (update.effective_user.id, str(amt)))
         cur = conn.execute("SELECT last_insert_rowid()")
         wid = cur.fetchone()[0]
-    context.user_data["awaiting_wallet_amount_eur"] = False
-    await update.message.reply_text(f"Richiesta inviata: € {amt}. Un admin valuterà la ricarica.")
+
+    await update.message.reply_text(f"Richiesta inviata 👌 (id #{wid}). Gli admin la valuteranno.")
 
     # notifica admin
     if ADMIN_IDS:
@@ -588,52 +535,47 @@ async def wallet_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def render_wallet_card(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int):
     ids = context.user_data.get("wallet_ids") or []
     if not ids:
-        await update.effective_message.reply_text("Nessuna richiesta."); return
+        msg = "Nessuna richiesta wallet in attesa."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg); return
+        else:
+            await update.message.reply_text(msg); return
     idx = max(0, min(idx, len(ids)-1))
-    context.user_data["wallet_idx"] = idx
     wid = ids[idx]
+    context.user_data["wallet_idx"] = idx
+
     with db() as conn:
-        cur = conn.execute(
-            """
-            SELECT w.id, w.user_id, w.amount_eur, w.status, COALESCE(w.created_at,''), COALESCE(w.note,''),
-                   COALESCE(u.username,''), COALESCE(u.first_name,''), COALESCE(u.last_name,''), COALESCE(u.wallet_kwh,0)
-            FROM wallet_requests w
-            LEFT JOIN users u ON u.user_id = w.user_id
-            WHERE w.id = ?
-            """,
-            (wid,)
-        )
-        row = cur.fetchone()
-    if not row:
-        await update.effective_message.reply_text(f"Richiesta #{wid} non trovata."); return
-    (_id, uid, amt, status, created_at, note, username, fn, ln, wallet_kwh) = row
-    who = f"@{username}" if username else ((fn or "") + (" " + ln if ln else "")).strip() or str(uid)
-    created_fmt = (created_at or "-").replace("T"," ")[:19]
-    text = (
-        f"[{idx+1}/{len(ids)}] Wallet #{_id} • {created_fmt}\n"
-        f"Utente: {who} (id {uid})\n"
-        f"Importo richiesto: € {amt}\n"
-        f"Wallet attuale: {fmt_kwh(Decimal(str(wallet_kwh)))} kWh"
+        cur = conn.execute("SELECT id, user_id, amount_eur, status, created_at FROM wallet_requests WHERE id=?", (wid,))
+        r = cur.fetchone()
+    if not r:
+        await update.message.reply_text("Elemento non trovato."); return
+
+    wid, uid, eur, status, created = r
+    caption = (
+        f"👛 Wallet request #{wid}\n"
+        f"Utente: {uid}\n"
+        f"Importo: € {eur}\n"
+        f"Stato: {status}\n"
+        f"Data: {created}\n"
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️", callback_data="wallet:nav:prev"),
-         InlineKeyboardButton("➡️", callback_data="wallet:nav:next")],
-        [InlineKeyboardButton("✅ Accetta", callback_data=f"wallet:accept:{_id}"),
-         InlineKeyboardButton("❌ Rifiuta", callback_data=f"wallet:reject:{_id}")],
+        [InlineKeyboardButton("⬅️ Prev", callback_data="wallet:nav:prev"),
+         InlineKeyboardButton("➡️ Next", callback_data="wallet:nav:next")],
+        [InlineKeyboardButton("✅ Accetta", callback_data=f"wallet:accept:{wid}"),
+         InlineKeyboardButton("❌ Rifiuta", callback_data=f"wallet:reject:{wid}")],
     ])
+
     if update.callback_query:
-        try:
-            await update.callback_query.edit_message_text(text, reply_markup=kb)
-        except Exception:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=kb)
+        await update.callback_query.edit_message_text(caption, reply_markup=kb)
     else:
-        await update.effective_message.reply_text(text, reply_markup=kb)
+        await update.message.reply_text(caption, reply_markup=kb)
 
 async def on_wallet_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     if not is_admin(q.from_user.id):
         await q.answer("Solo admin", show_alert=True); return
+
     data = q.data
     if data.startswith("wallet:nav:"):
         direction = data.split(":")[-1]
@@ -674,53 +616,80 @@ async def on_message_admin_wallet_kwh(update: Update, context: ContextTypes.DEFA
         if kwh <= 0:
             raise ValueError
     except Exception:
-        await update.message.reply_text("Valore non valido. Inserisci un numero positivo (kWh).")
+        await update.message.reply_text("Valore non valido. Inserisci kWh positivi (es. 15 o 12.5).")
         return
+
+    context.user_data["awaiting_wallet_kwh_for"] = None
     with db() as conn:
-        cur = conn.execute("SELECT user_id FROM wallet_requests WHERE id=? AND status='pending'", (wid,))
+        # accredito wallet_kwh e segno richiesta come approvata
+        cur = conn.execute("SELECT user_id FROM wallet_requests WHERE id=?", (wid,))
         r = cur.fetchone()
         if not r:
-            await update.message.reply_text("Richiesta non trovata o già processata.")
-            context.user_data.pop("awaiting_wallet_kwh_for", None); return
-        uid = r[0]
+            await update.message.reply_text("Richiesta non trovata."); return
+        uid = int(r[0])
         conn.execute("UPDATE users SET wallet_kwh = COALESCE(wallet_kwh,0) + ? WHERE user_id=?", (str(kwh), uid))
-        conn.execute(
-            "UPDATE wallet_requests SET status='approved', reviewed_at=datetime('now'), reviewer_id=? WHERE id=?",
-            (update.effective_user.id, wid),
-        )
-    context.user_data.pop("awaiting_wallet_kwh_for", None)
-    await update.message.reply_text(f"Accreditati {fmt_kwh(kwh)} kWh sul wallet dell'utente {uid}.")
+        conn.execute("UPDATE wallet_requests SET status='approved', reviewed_at=datetime('now'), reviewer_id=? WHERE id=?", (update.effective_user.id, wid))
+
+    await update.message.reply_text(f"✅ Accreditati {fmt_kwh(kwh)} kWh nel wallet dell'utente {uid}.")
     try:
-        await context.bot.send_message(chat_id=uid, text=f"La tua richiesta wallet è stata approvata. Accreditati {fmt_kwh(kwh)} kWh.")
+        await context.bot.send_message(chat_id=uid, text=f"👛 Il tuo wallet è stato ricaricato di {fmt_kwh(kwh)} kWh (richiesta #{wid}).")
     except Exception:
         pass
 
-# -------------------- DICHIARA RICARICA (UTENTE) — FOTO OBBLIGATORIA --------------------
+# -------------------- DICHIARAZIONE RICARICA (utente) --------------------
 
 async def on_decl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    ensure_user(q.from_user)
-    data = q.data
     uid = q.from_user.id
-
-    if data == "decl:start":
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔌 Slot 8", callback_data="decl:slot:8")],
-            [InlineKeyboardButton("🔌 Slot 3", callback_data="decl:slot:3")],
-            [InlineKeyboardButton("🔌 Slot 5", callback_data="decl:slot:5")],
-        ])
-        await q.edit_message_text("Seleziona lo slot che hai ricaricato:", reply_markup=kb)
+    if q.data == "decl:start":
+        context.user_data["decl_await_kwh"] = True
+        context.user_data["decl_kwh"] = None
+        context.user_data["decl_photo_id"] = None
+        context.user_data["decl_note"] = ""
+        await q.edit_message_text("Inserisci i kWh ricaricati (es. 12.5):")
         return
 
-    if data.startswith("decl:slot:"):
-        slot = int(data.split(":")[-1])
+    if q.data.startswith("decl:slot:"):
+        try:
+            slot = int(q.data.split(":")[-1])
+            if slot not in (8,3,5):
+                raise ValueError
+        except Exception:
+            await q.answer("Slot non valido", show_alert=True); return
+
         context.user_data["decl_slot"] = slot
-        context.user_data["decl_await_kwh"] = True
-        await q.edit_message_text(
-            f"Hai scelto Slot {slot}.\nInserisci i kWh da dichiarare (es. 12.5).\n\n"
-            "• Scrivi il numero"
-        )
+        # salva ricarica pending
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO recharges (user_id, slot, kwh, status, note, photo_file_id) VALUES (?,?,?,?,?,?)",
+                (uid, slot, str(context.user_data.get("decl_kwh")), "pending", context.user_data.get("decl_note",""), context.user_data.get("decl_photo_id"))
+            )
+            cur = conn.execute("SELECT last_insert_rowid()"); rid = cur.fetchone()[0]
+        await q.edit_message_text(f"Ricarica inviata ✅ (id #{rid}). Gli admin la valuteranno.")
+        # notifica admin
+        if ADMIN_IDS:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Approva", callback_data=f"approve:{rid}"),
+                 InlineKeyboardButton("❌ Rifiuta", callback_data=f"reject:{rid}")]
+            ])
+            photo_id = context.user_data.get("decl_photo_id")
+            for aid in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(
+                        chat_id=aid,
+                        text=f"📝 Nuova ricarica dichiarata #{rid}\nUtente: {uid}\nSlot: {slot}\nKWh: {fmt_kwh(context.user_data['decl_kwh'])}"
+                             + (f"\nNota: {context.user_data.get('decl_note')}" if context.user_data.get("decl_note") else ""),
+                        reply_markup=kb
+                    )
+                    if photo_id:
+                        await context.bot.send_photo(chat_id=aid, photo=photo_id, caption=f"Ricevuta ricarica #{rid}")
+                except Exception as e:
+                    log.warning("Notify admin recharge failed %s: %s", aid, e)
+        # pulizia stato
+        context.user_data["decl_kwh"] = None
+        context.user_data["decl_photo_id"] = None
+        context.user_data["decl_note"] = ""
         return
 
 async def on_message_decl_kwh(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -755,65 +724,22 @@ async def on_message_decl_photo(update: Update, context: ContextTypes.DEFAULT_TY
 async def on_message_decl_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("decl_await_note"):
         return
-    txt = (update.message.text or "").strip()
-    note = None if txt.lower() == "ok" else (txt or None)
+    note = (update.message.text or "").strip()
+    context.user_data["decl_note"] = "" if note.lower() == "ok" else note
 
-    uid = update.effective_user.id
-    slot = context.user_data.get("decl_slot")
-    kwh  = context.user_data.get("decl_kwh")
-    photo_id = context.user_data.get("decl_photo_id")
-
-    if not slot or not kwh or not photo_id:
-        for k in ["decl_slot","decl_kwh","decl_photo_id","decl_await_kwh","decl_await_photo","decl_await_note"]:
-            context.user_data.pop(k, None)
-        await update.message.reply_text("Qualcosa è andato storto, riprova.", reply_markup=main_keyboard(uid))
-        return
-
-    # Rate limit 60s
-    rem = check_rate_limit(uid, "declare", 60)
-    if rem > 0:
-        await update.message.reply_text(f"Hai già inviato una dichiarazione da poco. Riprova tra {rem} secondi.",
-                                        reply_markup=main_keyboard(uid))
-        return
-
-    # Salva ricarica
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO recharges (user_id, slot, kwh, status, note, photo_file_id) VALUES (?,?,?,?,?,?)",
-            (uid, int(slot), str(kwh), 'pending', note, photo_id)
-        )
-        cur = conn.execute("SELECT last_insert_rowid()")
-        rid = cur.fetchone()[0]
-
-    # Pulisci stato
-    for k in ["decl_slot","decl_kwh","decl_photo_id","decl_await_kwh","decl_await_photo","decl_await_note"]:
-        context.user_data.pop(k, None)
-
+    # scegli slot
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("8 kW", callback_data="decl:slot:8"),
+         InlineKeyboardButton("3 kW", callback_data="decl:slot:3"),
+         InlineKeyboardButton("5 kW", callback_data="decl:slot:5")],
+    ])
     await update.message.reply_text(
-        f"✅ Dichiarazione inviata.\n• Slot {slot}\n• kWh: {fmt_kwh(kwh)}\n"
-        + (f"• Nota: {note}\n" if note else "")
-        + "Un admin la valuterà a breve.",
-        reply_markup=main_keyboard(uid)
+        f"Conferma:\nKWh: {fmt_kwh(context.user_data['decl_kwh'])}"
+        + (f"\nNota: {context.user_data['decl_note']}" if context.user_data['decl_note'] else "")
+        + "\n\nSeleziona lo *slot*:",
+        reply_markup=kb, parse_mode="Markdown"
     )
-
-    # Notifica admin con pulsanti Approva/Rifiuta
-    if ADMIN_IDS:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Approva", callback_data=f"approve:{rid}"),
-             InlineKeyboardButton("❌ Rifiuta", callback_data=f"reject:{rid}")],
-        ])
-        for aid in ADMIN_IDS:
-            try:
-                await context.bot.send_message(
-                    chat_id=aid,
-                    text=f"📝 Nuova ricarica dichiarata #{rid}\nUtente: {uid}\nSlot: {slot}\nKWh: {fmt_kwh(kwh)}"
-                         + (f"\nNota: {note}" if note else ""),
-                    reply_markup=kb
-                )
-                # inoltra anche la foto
-                await context.bot.send_photo(chat_id=aid, photo=photo_id, caption=f"Ricevuta ricarica #{rid}")
-            except Exception as e:
-                log.warning("Notify admin recharge failed %s: %s", aid, e)
+    context.user_data["decl_await_note"] = False
 
 # -------------------- USERS LIST + DELETE --------------------
 
@@ -835,55 +761,49 @@ async def utenti(update: Update, context: ContextTypes.DEFAULT_TYPE):
             page = max(1, int(args[i])); i += 1
         except Exception:
             pass
-    if i < len(args) and args[i].lower() == "cerca" and i+1 < len(args):
-        query = args[i+1]; i += 2
+    if i < len(args) and args[i].lower() == "cerca" and (i+1) < len(args):
+        query = " ".join(args[i+1:])
 
-    where = ["1=1"]; params: List[Any] = []
+    where = []
+    params: List = []
     if status == "approvati":
-        where.append("COALESCE(approved,0)=1")
+        where.append("approved=1")
     elif status == "pending":
-        where.append("COALESCE(approved,0)=0")
+        where.append("approved=0")
     if query:
-        where.append("(IFNULL(username,'') LIKE ? OR IFNULL(first_name,'') LIKE ? OR IFNULL(last_name,'') LIKE ? OR CAST(user_id AS TEXT) LIKE ?)")
-        like = f"%{query}%"; params += [like, like, like, like]
+        where.append("(COALESCE(username,'') LIKE ? OR first_name LIKE ? OR last_name LIKE ?)")
+        params += [f"%{query}%", f"%{query}%", f"%{query}%"]
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    offset = (page-1) * PAGE_SIZE_USERS
 
     with db() as conn:
-        cur = conn.execute(f"SELECT COUNT(*) FROM users WHERE {' AND '.join(where)}", tuple(params))
+        cur = conn.execute(f"SELECT COUNT(*) FROM users {where_sql}", params)
         total = cur.fetchone()[0]
-        offset = (page-1) * PAGE_SIZE_USERS
         cur = conn.execute(
             f"""
-            SELECT user_id, COALESCE(username,''), COALESCE(first_name,''), COALESCE(last_name,''),
-                   COALESCE(balance_slot8,0), COALESCE(balance_slot3,0), COALESCE(balance_slot5,0), COALESCE(wallet_kwh,0),
-                   COALESCE(approved,0), COALESCE(created_at,'')
+            SELECT user_id, username, first_name, last_name, approved, balance_slot8, balance_slot3, balance_slot5, wallet_kwh, created_at
             FROM users
-            WHERE {' AND '.join(where)}
-            ORDER BY user_id ASC
-            LIMIT ? OFFSET ?
+            {where_sql}
+            ORDER BY created_at DESC
+            LIMIT {PAGE_SIZE_USERS} OFFSET {offset}
             """,
-            tuple(params) + (PAGE_SIZE_USERS, offset),
+            params
         )
         rows = cur.fetchall()
 
-    if not rows:
-        await update.message.reply_text("Nessun utente trovato."); return
-
-    lines = [f"Utenti {status} – pagina {page} di {(total+PAGE_SIZE_USERS-1)//PAGE_SIZE_USERS} – risultati: {total}"]
-    for (uid, username, first_name, last_name, b8, b3, b5, wallet, appr, created_at) in rows:
-        name = (first_name or "") + (" " + last_name if last_name else "")
-        who = f"@{username}" if username else (name.strip() or str(uid))
-        lines.append(f"• {who} (id {uid}) – Approvato: {bool(appr)} – 8:{fmt_kwh(Decimal(str(b8)))}  3:{fmt_kwh(Decimal(str(b3)))}  5:{fmt_kwh(Decimal(str(b5)))}  Wallet:{fmt_kwh(Decimal(str(wallet)))}")
-
-    nav = []
-    if page > 1:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"users:page:{status}:{page-1}:{query or '-'}"))
-    if offset + PAGE_SIZE_USERS < total:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"users:page:{status}:{page+1}:{query or '-'}"))
-    buttons = [nav] if nav else []
-    buttons.append([InlineKeyboardButton("🗑️ Elimina utente", callback_data="users:delete:start")])
-    kb = InlineKeyboardMarkup(buttons)
-
-    await update.message.reply_text("\n".join(lines), reply_markup=kb)
+    lines = [f"👥 Utenti – {status} – pagina {page}"]
+    for (uid, username, fn, ln, approved, b8, b3, b5, w, created) in rows:
+        name = (fn or "") + (" " + ln if ln else "")
+        lines.append(
+            f"• {uid} {'✅' if approved else '⏳'} {('@'+username) if username else name or ''} – "
+            f"8kW {fmt_kwh(b8)} | 3kW {fmt_kwh(b3)} | 5kW {fmt_kwh(b5)} | 👛 {fmt_kwh(w)}"
+        )
+    nav = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Prev", callback_data=f"users:page:{status}:{max(1,page-1)}:{query or '-'}"),
+         InlineKeyboardButton("➡️ Next", callback_data=f"users:page:{status}:{page+1}:{query or '-'}")],
+        [InlineKeyboardButton("🗑️ Elimina utente", callback_data="users:delete:start")]
+    ])
+    await update.message.reply_text("\n".join(lines) + f"\n\nTotale: {total}", reply_markup=nav)
 
 async def on_users_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -916,31 +836,25 @@ async def on_userpick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = int(uid_s)
     except Exception:
         await q.answer("Selezione non valida", show_alert=True); return
-
     if tag == "saldo":
-        if not is_admin(q.from_user.id):
-            await q.answer("Solo admin", show_alert=True); return
-        b = get_balances(uid)
-        wallet = get_wallet_kwh(uid)
+        dummy = Update.de_json(q.to_dict(), context.application.bot)
+        dummy.effective_user.id = uid  # for display only
+        balances = get_balances(uid); wallet = get_wallet_kwh(uid)
         await q.edit_message_text(
-            "Saldi utente {oid}:\n"
-            f"• Slot 8: {fmt_kwh(b[8])} kWh\n"
-            f"• Slot 3: {fmt_kwh(b[3])} kWh\n"
-            f"• Slot 5: {fmt_kwh(b[5])} kWh\n"
-            f"• Wallet: {fmt_kwh(wallet)} kWh".format(oid=uid),
-            reply_markup=main_keyboard(q.from_user.id)
+            "📊 *Saldo attuale*\n"
+            f"• 8 kW: {fmt_kwh(balances[8])} kWh\n"
+            f"• 3 kW: {fmt_kwh(balances[3])} kWh\n"
+            f"• 5 kW: {fmt_kwh(balances[5])} kWh\n\n"
+            f"👛 Wallet: {fmt_kwh(wallet)} kWh",
+            parse_mode="Markdown"
         )
-        return
-
-    if tag == "delete":
-        if not is_admin(q.from_user.id):
-            await q.answer("Solo admin", show_alert=True); return
+    elif tag == "delete":
+        context.user_data["awaiting_delete_user"] = False
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Conferma", callback_data=f"userdel:yes:{uid}"),
              InlineKeyboardButton("❌ Annulla", callback_data=f"userdel:no:{uid}")]
         ])
         await q.edit_message_text(f"Confermi l'eliminazione dell'utente {uid}?", reply_markup=kb)
-        return
 
 async def on_userdel_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -948,27 +862,28 @@ async def on_userdel_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_admin(q.from_user.id):
         await q.answer("Solo admin", show_alert=True); return
     try:
-        _, choice, uid_s = q.data.split(":", 2)
+        _, yesno, uid_s = q.data.split(":")
         uid = int(uid_s)
     except Exception:
-        await q.answer("Selezione non valida", show_alert=True); return
-    if choice == "no":
-        await q.edit_message_text("Operazione annullata."); return
+        await q.answer("Callback non valida", show_alert=True); return
+    if yesno == "no":
+        await q.edit_message_text("Annullato."); return
     with db() as conn:
         conn.execute("DELETE FROM users WHERE user_id=?", (uid,))
         conn.execute("DELETE FROM recharges WHERE user_id=?", (uid,))
         conn.execute("DELETE FROM wallet_requests WHERE user_id=?", (uid,))
-    await q.edit_message_text(f"Utente {uid} eliminato.")
+    await q.edit_message_text(f"Utente {uid} eliminato ✅")
 
 async def on_message_delete_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("awaiting_delete_user"):
         return
-    txt = (update.message.text or "").strip()
-    target = resolve_user_identifier(txt)
-    if target is None:
-        await update.message.reply_text("Utente non trovato."); return
+    q = (update.message.text or "").strip()
+    target = resolve_user_identifier(q)
     if isinstance(target, list):
-        await ask_user_pick(update, target, "delete"); return
+        await ask_user_pick(update, target, "delete")
+        return
+    if not isinstance(target, int):
+        await update.message.reply_text("Nessun utente trovato."); return
     uid = int(target)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Conferma", callback_data=f"userdel:yes:{uid}"),
@@ -1000,52 +915,48 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buf = io.StringIO(); w = csv.writer(buf)
         w.writerow(["user_id","username","first_name","last_name","balance_slot8","balance_slot3","balance_slot5","wallet_kwh","approved","created_at"])
         for r in rows: w.writerow(list(r))
-        data = io.BytesIO(buf.getvalue().encode("utf-8")); data.name = "users.csv"
-        await context.bot.send_document(chat_id=update.effective_chat.id, document=data, caption="Esportazione utenti")
+        buf.seek(0)
+        await update.message.reply_document(document=("users.csv", buf.getvalue().encode("utf-8")), filename="users.csv", caption="Export utenti")
         return
+
     if what == "recharges":
-        date_from = args[1] if len(args) >= 2 else None
-        date_to   = args[2] if len(args) >= 3 else None
-        where = ["1=1"]; params: List[Any] = []
+        date_from = None; date_to = None
+        if len(args) >= 2: date_from = args[1]
+        if len(args) >= 3: date_to = args[2]
+        where = []; params = []
         if date_from:
-            where.append("created_at >= ?"); params.append(date_from)
+            where.append("DATE(created_at) >= DATE(?)"); params.append(date_from)
         if date_to:
-            where.append("created_at <= ?||'T23:59:59'"); params.append(date_to)
+            where.append("DATE(created_at) <= DATE(?)"); params.append(date_to)
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
         with db() as conn:
             cur = conn.execute(
                 f"""
-                SELECT id, user_id, slot, kwh, status, created_at, reviewed_at, reviewer_id, note, photo_file_id
+                SELECT id, user_id, slot, kwh, status, note, created_at, reviewed_at, reviewer_id
                 FROM recharges
-                WHERE {' AND '.join(where)}
+                {where_sql}
                 ORDER BY id ASC
-                """,
-                tuple(params)
+                """, params
             )
             rows = cur.fetchall()
         import csv, io
         buf = io.StringIO(); w = csv.writer(buf)
-        w.writerow(["id","user_id","slot","kwh","status","created_at","reviewed_at","reviewer_id","note","photo_file_id"])
+        w.writerow(["id","user_id","slot","kwh","status","note","created_at","reviewed_at","reviewer_id"])
         for r in rows: w.writerow(list(r))
-        data = io.BytesIO(buf.getvalue().encode("utf-8")); data.name = "recharges.csv"
-        await context.bot.send_document(chat_id=update.effective_chat.id, document=data, caption="Esportazione ricariche")
+        buf.seek(0)
+        await update.message.reply_document(document=("recharges.csv", buf.getvalue().encode("utf-8")), filename="recharges.csv", caption="Export ricariche")
         return
-    await update.message.reply_text("Uso: /export users | /export recharges [YYYY-MM-DD] [YYYY-MM-DD]")
 
-# -------------------- STARTUP / PING / ERROR --------------------
+    await update.message.reply_text("Tipo export non valido.")
+
+# -------------------- STARTUP / ERROR --------------------
 
 async def startup_notify(app: Application):
     try:
-        print("[BOOT] saldo-bot avviato ✅")
-        print(f"Python: {sys.version.split()[0]} • PTB: {telegram.__version__}")
-        print(f"DB_PATH: {DB_PATH}")
-        total_handlers = sum(len(h) for h in app.handlers.values()) if hasattr(app, "handlers") else 0
-        print(f"Handlers: {total_handlers}")
-        admins = list(ADMIN_IDS)
-        if admins:
-            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            for aid in admins:
+        if ADMIN_IDS:
+            for aid in ADMIN_IDS:
                 try:
-                    await app.bot.send_message(chat_id=aid, text=f"🔔 saldo-bot avviato\n{ts}\nPython {sys.version.split()[0]} • PTB {telegram.__version__}")
+                    await app.bot.send_message(chat_id=aid, text=f"✅ Bot avviato su {os.getenv('RAILWAY_SERVICE_NAME','local')}\nPython {sys.version.split()[0]} • PTB {telegram.__version__}")
                 except Exception as e:
                     print("[BOOT] notify admin failed:", aid, e)
         try:
@@ -1071,15 +982,12 @@ async def daily_ping(context: ContextTypes.DEFAULT_TYPE):
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("[ERROR] Unhandled exception", exc_info=context.error)
 
-# -------------------- MAIN --------------------
+# -------------------- FACTORY --------------------
 
-def main():
+def create_application():
     if not TOKEN:
-        log.error("TELEGRAM_TOKEN non impostato")
-        sys.exit(1)
-
+        raise RuntimeError('TELEGRAM_TOKEN non impostato')
     migrate()
-
     app = Application.builder().token(TOKEN).post_init(startup_notify).build()
 
     # Commands
@@ -1092,7 +1000,7 @@ def main():
     app.add_handler(CommandHandler("utenti", utenti))
     app.add_handler(CommandHandler("export", export))
 
-    # Callbacks (menu / pending / wallet / users / declare / approve-reject)
+    # Callbacks
     app.add_handler(CallbackQueryHandler(on_main_menu, pattern=r"^menu:(saldo|pending|walletpending|utenti|help)$"))
     app.add_handler(CallbackQueryHandler(on_pending_action, pattern=r"^pending:(photo|info):\d+$"))
     app.add_handler(CallbackQueryHandler(on_pending_action, pattern=r"^pending:nav:(prev|next)$"))
@@ -1117,6 +1025,16 @@ def main():
 
     # Error handler
     app.add_error_handler(on_error)
+    return app
+
+# -------------------- MAIN --------------------
+
+def main():
+    if not TOKEN:
+        log.error("TELEGRAM_TOKEN non impostato")
+        sys.exit(1)
+
+    app = create_application()
 
     log.info("Bot in avvio...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
