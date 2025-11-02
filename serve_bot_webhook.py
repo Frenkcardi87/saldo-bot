@@ -1,47 +1,35 @@
-# serve_bot_webhook.py — versione pronta per PTB 21.6 + FastAPI + Railway
+# serve_bot_webhook.py — FastAPI + PTB via build_application() from bot_slots_flow
 import os
 import logging
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import PlainTextResponse
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+
+# *** Importa l'Application completa dal tuo bot ***
+from bot_slots_flow import build_application as build_ptb_app
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("serve_bot_webhook")
 
-APP_URL = os.environ.get("APP_URL", "https://saldo-bot-production.up.railway.app")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+APP_URL = os.environ.get("APP_URL", "https://saldo-bot-production.up.railway.app").rstrip("/")
 WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/telegram")
 WEBHOOK_SECRET = os.environ.get("TG_WEBHOOK_SECRET", "PLEASE_CHANGE_ME")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Missing TELEGRAM_TOKEN env var")
 
 app = FastAPI(title="saldo-bot webhook")
 
-# PTB Application istanza globale
-ptb_app: Application = Application.builder().token(TELEGRAM_TOKEN).build()
-
-
-# --- Handlers minimi (fallback) ---
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Gestisce sia /start che messaggi diretti per smoke-test
-    if update.message:
-        await update.message.reply_text("Ciao! ✅ Bot attivo. Inviami un comando o un messaggio.")
-    elif update.callback_query:
-        await update.callback_query.answer("Bot attivo")
-
-
-# Registra almeno /start (se poi ne aggiungi altri altrove, restano)
-ptb_app.add_handler(CommandHandler("start", cmd_start))
+# Crea l'istanza PTB usando il tuo build_application()
+ptb_app = build_ptb_app()
 
 
 @app.on_event("startup")
 async def on_startup():
-    # Avvia PTB e imposta webhook
     await ptb_app.initialize()
     await ptb_app.start()
-    url = f"{APP_URL.rstrip('/')}{WEBHOOK_PATH}"
+    url = f"{APP_URL}{WEBHOOK_PATH}"
     await ptb_app.bot.set_webhook(
         url=url,
         secret_token=WEBHOOK_SECRET,
@@ -67,13 +55,12 @@ async def root():
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
-    # Verifica secret header (se non matcha -> 403)
+    # Verifica secret header (richiesto da Telegram se impostato nel set_webhook)
     h = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
     if h != WEBHOOK_SECRET:
         raise HTTPException(403, "Forbidden")
 
     data = await request.json()
     update = Update.de_json(data, ptb_app.bot)
-    # processa l'update
     await ptb_app.process_update(update)
     return Response(status_code=200)
