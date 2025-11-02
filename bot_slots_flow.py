@@ -56,10 +56,59 @@ DATE_FMT = "%Y-%m-%d %H:%M:%S"
 # --------------------
 # DB LAYER
 # --------------------
+import sqlite3, os, pathlib, logging
+
+def open_sqlite(db_path: str):
+    conn = sqlite3.connect(
+        db_path,
+        timeout=30,
+        check_same_thread=False,
+        isolation_level=None,      # autocommit
+        cached_statements=0
+    )
+    cur = conn.cursor()
+    # PRAGMA per FS “delicati” (Railway Trial/Volume)
+    cur.execute("PRAGMA journal_mode=OFF;")     # niente -journal/-wal
+    cur.execute("PRAGMA synchronous=OFF;")
+    cur.execute("PRAGMA temp_store=MEMORY;")
+    cur.execute("PRAGMA mmap_size=0;")
+    cur.execute("PRAGMA locking_mode=NORMAL;")
+    return conn
+
+os.environ.setdefault("TMPDIR", "/var/data")
+os.environ.setdefault("SQLITE_TMPDIR", "/var/data")
+
 class DB:
-    def __init__(self, path: str):
-        self.path = path
+    def __init__(self, db_path):
+        log = logging.getLogger(__name__)
+        self.path = db_path or "/var/data/kwh_slots.db"
+
+        # crea cartella se non esiste
+        pathlib.Path(os.path.dirname(self.path)).mkdir(parents=True, exist_ok=True)
+
+        # test di scrittura
+        testfile = os.path.join(os.path.dirname(self.path), ".rw_test")
+        try:
+            with open(testfile, "w") as f:
+                f.write("ok")
+            os.remove(testfile)
+            log.info("Write test OK on %s", self.path)
+        except Exception as e:
+            log.exception("Write test failed on %s", self.path)
+
+        # apre la connessione sicura
+        self.conn = open_sqlite(self.path)
+
+        # inizializza il DB (le CREATE TABLE rimangono le tue)
         self._init_db()
+
+
+class DB:
+    def __init__(self, db_path):
+        self.path = db_path
+        self.conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._init_db()
+
 
     @contextmanager
     def conn(self):
