@@ -411,7 +411,12 @@ async def show_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE, target_
 async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     DBI.ensure_user(user)
-    if is_admin(user.id) and context.args:\n        arg = context.args[0]\n        if arg.isdigit():\n            return await show_saldo(update, context, int(arg))\n    await show_saldo(update, context)
+if is_admin(user.id) and context.args:
+    arg = context.args[0]
+    if arg.isdigit():
+        return await show_saldo(update, context, int(arg))
+
+await show_saldo(update, context)
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return await smart_reply(update, context, "Solo admin.")
