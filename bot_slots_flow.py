@@ -261,3 +261,81 @@ def build_application():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     return app
+
+# ==================== HANDLERS MINIMI + build_application COMPLETA ====================
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+import os
+
+def _fmt_name(u: Update):
+    chat_id = u.effective_chat.id if u.effective_chat else 0
+    user = u.effective_user
+    username = (user.username or "") if user else ""
+    first_name = (user.first_name or "") if user else ""
+    last_name = (user.last_name or "") if user else ""
+    return chat_id, username, first_name, last_name
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id, username, first_name, last_name = _fmt_name(update)
+    DBI.get_or_create_user(chat_id, username, first_name, last_name)
+    if update.message:
+        await update.message.reply_text("Ciao! ✅ Bot attivo. Inviami un comando o un messaggio.")
+
+async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id, username, first_name, last_name = _fmt_name(update)
+    DBI.get_or_create_user(chat_id, username, first_name, last_name)
+    s1, s3, s5, s8, wal = DBI.get_balance_summary(chat_id)
+    msg = (
+        "📊 *Situazione KWh*\n"
+        f"• Slot1: `{s1}`\n"
+        f"• Slot3: `{s3}`\n"
+        f"• Slot5: `{s5}`\n"
+        f"• Slot8: `{s8}`\n"
+        f"• Wallet: `{wal}`"
+    )
+    if update.message:
+        await update.message.reply_markdown(msg)
+
+async def cmd_ricarica(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id, username, first_name, last_name = _fmt_name(update)
+    user_id = DBI.get_or_create_user(chat_id, username, first_name, last_name)
+
+    args = context.args or []
+    if len(args) != 2:
+        await update.message.reply_text("Usa: /ricarica <slot1|slot3|slot5|slot8|wallet> <kwh>")
+        return
+    slot = args[0].lower().strip()
+    try:
+        kwh = float(args[1].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("KWh non valido. Esempio: /ricarica slot3 4.5")
+        return
+    if slot not in ("slot1","slot3","slot5","slot8","wallet"):
+        await update.message.reply_text("Slot non valido. Usa: slot1, slot3, slot5, slot8, wallet")
+        return
+
+    DBI.add_pending_recharge(user_id, slot, kwh)
+    await update.message.reply_text(f"Richiesta ricarica creata: {slot} +{kwh} kWh (in attesa di approvazione).")
+
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id, username, first_name, last_name = _fmt_name(update)
+    user_id = DBI.get_or_create_user(chat_id, username, first_name, last_name)
+    text = update.message.text if update.message else ""
+    if text.startswith("/"):
+        return
+    DBI.add_note(user_id, text)
+    await update.message.reply_text("📝 Nota salvata. (Digita /saldo per vedere i tuoi kWh)")
+
+def build_application():
+    """Restituisce l'Application PTB con gli handler registrati."""
+    token = os.environ.get("TELEGRAM_TOKEN")
+    if not token:
+        raise RuntimeError("Missing TELEGRAM_TOKEN")
+
+    app = Application.builder().token(token).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("saldo", cmd_saldo))
+    app.add_handler(CommandHandler("ricarica", cmd_ricarica))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    return app
+# ==================== FINE BLOCCO ====================
