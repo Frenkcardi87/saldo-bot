@@ -1,5 +1,5 @@
 # bot_slots_flow.py — WALLET-only accounting with confirmations
-# (Patched: wizard ricarica sempre con foto; /credita prosegue; handler ordering + block=False; logs)
+# Patch: ensure photo prompt after kWh, stronger state checks, and notifications for /credita
 import os
 import pathlib
 import sqlite3
@@ -72,7 +72,7 @@ class DB:
                 first_name TEXT,
                 last_name TEXT,
                 approved INTEGER DEFAULT 1,
-                slot1_kwh REAL DEFAULT 0,   -- legacy, non usati
+                slot1_kwh REAL DEFAULT 0,
                 slot3_kwh REAL DEFAULT 0,
                 slot5_kwh REAL DEFAULT 0,
                 slot8_kwh REAL DEFAULT 0,
@@ -224,16 +224,7 @@ class DB:
             cur = con.cursor()
             cur.execute("UPDATE pending SET status='rejected', approved_by=? WHERE id=?", (admin_id, pending_id))
 
-# DB instance
-def _init_db_instance() -> DB:
-    DB_PATH = os.environ.get("DB_PATH", DEFAULT_DB_PATH).strip()
-    try:
-        return DB(DB_PATH)
-    except Exception:
-        log.exception("DB init failed (path=%s). Falling back to in-memory.", DB_PATH)
-        return DB(":memory:")
-
-DBI = _init_db_instance()
+DBI = (lambda: DB(os.environ.get("DB_PATH", DEFAULT_DB_PATH).strip() or DEFAULT_DB_PATH))()
 
 # -------------------- Helpers --------------------
 def _fmt_name(u: Update):
@@ -295,8 +286,14 @@ async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_markdown(f"💼 *Wallet*: *{wallet}* kWh", reply_markup=main_keyboard())
 
 # -------------------- Wizard Ricarica (forzato) --------------------
+WZ_KEY = "ricarica_wz"
+WZ_EXPECT = "expect"
+WZ_DATA = "data"
+def _wz_reset(context): context.user_data.pop(WZ_KEY, None)
+def _wz_start(context): context.user_data[WZ_KEY] = {WZ_EXPECT: "slot", WZ_DATA: {}}
+def _wz(context): return context.user_data.get(WZ_KEY, None)
+
 async def wizard_ricarica_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Forziamo sempre il wizard, anche se l’utente passa argomenti
     _wz_start(context)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Slot1", callback_data="slot:slot1"),
@@ -310,7 +307,7 @@ async def wizard_ricarica_start(update: Update, context: ContextTypes.DEFAULT_TY
         parse_mode="Markdown", reply_markup=kb
     )
 
-# Foto con didascalia "slot3 4.5" (rimane disponibile come scorciatoia)
+# Foto con didascalia "slot3 4.5" (scorciatoia)
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id, username, first_name, last_name = _fmt_name(update)
     user_id = DBI.get_or_create_user(chat_id, username, first_name, last_name)
@@ -347,15 +344,6 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await _notify_admins_new_pending(context, pid, user_id, slot, kwh, "foto", local_path)
 
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id, username, first_name, last_name = _fmt_name(update)
-    user_id = DBI.get_or_create_user(chat_id, username, first_name, last_name)
-    text = update.message.text if update.message else ""
-    if text.startswith("/"):
-        return
-    DBI.add_note(user_id, text)
-    await update.message.reply_text("📝 Nota salvata.", reply_markup=main_keyboard())
-
 # -------------------- Admin: lists & approvals --------------------
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update.effective_chat.id):
@@ -390,14 +378,20 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _notify_user_wallet(context: ContextTypes.DEFAULT_TYPE, user_id: int, add_kwh: float):
     chat_id = DBI.get_chat_id_by_user_id(user_id)
-    if not chat_id:
-        return
     wallet = DBI.get_wallet_by_user_id(user_id)
-    txt = f"✅ La tua ricarica è stata *approvata*: +*{add_kwh}* kWh → Wallet.\nSaldo attuale: *{wallet}* kWh"
-    try:
-        await context.bot.send_message(chat_id, txt, parse_mode="Markdown", reply_markup=main_keyboard())
-    except Exception:
-        log.exception("Notify user failed")
+    if chat_id:
+        txt = f"✅ Ricarica *accreditata*: +*{add_kwh}* kWh → Wallet.\nSaldo attuale: *{wallet}* kWh"
+        try:
+            await context.bot.send_message(chat_id, txt, parse_mode="Markdown", reply_markup=main_keyboard())
+        except Exception:
+            log.exception("Notify user failed")
+
+async def _notify_admins_text(context: ContextTypes.DEFAULT_TYPE, text: str):
+    for admin in _admin_ids():
+        try:
+            await context.bot.send_message(admin, text, parse_mode="Markdown")
+        except Exception:
+            log.exception("Notify admin text failed: %s", admin)
 
 async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_id = update.effective_chat.id
@@ -413,6 +407,7 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id, slot, kwh = res
     await update.message.reply_text(f"✅ Approvata ID {pid}: user#{user_id} {slot}+{kwh} kWh → Wallet", reply_markup=main_keyboard())
     await _notify_user_wallet(context, user_id, kwh)
+    await _notify_admins_text(context, f"ℹ️ *Log*: approvata ID {pid} da admin {admin_id} — user#{user_id} +{kwh} kWh ({slot}).")
 
 async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_id = update.effective_chat.id
@@ -424,12 +419,12 @@ async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pid = int(args[0])
     DBI.reject_pending(pid, admin_id=admin_id)
     await update.message.reply_text(f"❌ Rifiutata ID {pid}", reply_markup=main_keyboard())
+    await _notify_admins_text(context, f"ℹ️ *Log*: rifiutata ID {pid} da admin {admin_id}.")
 
 # -------------------- Admin Credit Wizard (wallet only) --------------------
 AC_KEY = "admin_credit_wz"
 AC_EXPECT = "expect"         # 'user' | 'kwh'
 AC_DATA = "data"             # {'chat_id':..., 'kwh':...}
-
 def _ac_reset(context): context.user_data.pop(AC_KEY, None)
 def _ac_start(context): context.user_data[AC_KEY] = {AC_EXPECT: "user", AC_DATA: {}}
 def _ac(context): return context.user_data.get(AC_KEY, None)
@@ -485,21 +480,16 @@ async def ac_input_kwh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     res = DBI.approve_pending(pid, admin_id=admin_chat)
     _ac_reset(context)
     if res:
-        await update.message.reply_text(f"✅ Accreditati *{kwh}* kWh sul *Wallet* dell'utente *{cid}*.", parse_mode="Markdown", reply_markup=main_keyboard())
-        # notify target user
+        await update.message.reply_text(
+            f"✅ Accreditati *{kwh}* kWh sul *Wallet* dell'utente *{cid}*.\nID operazione: {pid}",
+            parse_mode="Markdown", reply_markup=main_keyboard()
+        )
         await _notify_user_wallet(context, uid, kwh)
+        await _notify_admins_text(context, f"ℹ️ *Log accredito admin*: admin {admin_chat} → user#{uid} ({cid}) +{kwh} kWh (ID {pid}).")
     else:
         await update.message.reply_text("Errore in accredito.", reply_markup=main_keyboard())
 
 # -------------------- Wizard Ricarica --------------------
-WZ_KEY = "ricarica_wz"
-WZ_EXPECT = "expect"
-WZ_DATA = "data"
-
-def _wz_reset(context): context.user_data.pop(WZ_KEY, None)
-def _wz_start(context): context.user_data[WZ_KEY] = {WZ_EXPECT: "slot", WZ_DATA: {}}
-def _wz(context): return context.user_data.get(WZ_KEY, None)
-
 async def _notify_admins_new_pending(context: ContextTypes.DEFAULT_TYPE, pid: int, user_id: int, slot: str, kwh: float, note: str, photo_path: Optional[str]):
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton(f"✅ Approva {pid}", callback_data=f"approve:{pid}"),
@@ -542,24 +532,28 @@ async def wizard_choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def wizard_input_kwh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.info("WZ_KWH: wz=%s txt=%s", _wz(context), (update.message.text if update.message else None))
     wz = _wz(context)
-    if not wz or wz.get(WZ_EXPECT) != "kwh": return
+    if not wz or wz.get(WZ_EXPECT) != "kwh":
+        return
     txt = (update.message.text or "").strip()
     try:
         kwh = float(txt.replace(",", "."))
     except ValueError:
-        await update.message.reply_text("Valore non valido. Inserisci i kWh (es: 4.5).", reply_markup=main_keyboard()); return
+        await update.message.reply_text("Valore non valido. Inserisci i kWh (es: 4.5).", reply_markup=main_keyboard())
+        return
     wz[WZ_DATA]["kwh"] = kwh
     wz[WZ_EXPECT] = "photo"
     await update.message.reply_text(
-        f"Riepilogo provvisorio:\n• Slot: {wz[WZ_DATA]['slot']}\n• kWh {kwh}\n\nOra *invia la foto* della ricarica.",
+        f"OK 👍 Riepilogo:\n• Slot: {wz[WZ_DATA]['slot']}\n• kWh: {kwh}\n\n*ORA INVIA UNA FOTO* della ricarica.",
         parse_mode="Markdown", reply_markup=main_keyboard()
     )
 
 async def wizard_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wz = _wz(context)
-    if not wz or wz.get(WZ_EXPECT) != "photo": return
+    if not wz or wz.get(WZ_EXPECT) != "photo":
+        return
     photo = update.message.photo[-1] if update.message and update.message.photo else None
-    if not photo: return
+    if not photo:
+        return
     file = await context.bot.get_file(photo.file_id)
     local_path = f"{PHOTOS_DIR}/{photo.file_id}.jpg"
     await file.download_to_drive(local_path)
@@ -590,7 +584,8 @@ async def wizard_declare_or_note(update: Update, context: ContextTypes.DEFAULT_T
 async def wizard_input_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.info("WZ_NOTE: wz=%s txt=%s", _wz(context), (update.message.text if update.message else None))
     wz = _wz(context)
-    if not wz or wz.get(WZ_EXPECT) != "note": return
+    if not wz or wz.get(WZ_EXPECT) != "note":
+        return
     note = (update.message.text or "").strip()
     await _wizard_finalize(update, context, note=note)
 
@@ -624,7 +619,7 @@ async def cmd_annulla(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.callback_query: return
     data = update.callback_query.data or ""
-    if ":" not in data: 
+    if ":" not in data:
         await update.callback_query.answer(); return
     action, pid_s = data.split(":", 1)
     admin_id = update.effective_chat.id
@@ -640,12 +635,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.callback_query.answer("Approvata ✅", show_alert=True)
             await update.callback_query.message.reply_text(f"✅ Approvata ID {pid}: user#{user_id} {slot}+{kwh} → Wallet", reply_markup=main_keyboard())
             await _notify_user_wallet(context, user_id, kwh)
+            await _notify_admins_text(context, f"ℹ️ *Log*: approvata ID {pid} da admin {admin_id} — user#{user_id} +{kwh} kWh ({slot}).")
         else:
             await update.callback_query.answer("Già gestita/inesistente", show_alert=True)
     elif action == "reject":
         DBI.reject_pending(pid, admin_id=admin_id)
         await update.callback_query.answer("Rifiutata ❌", show_alert=True)
         await update.callback_query.message.reply_text(f"❌ Rifiutata ID {pid}", reply_markup=main_keyboard())
+        await _notify_admins_text(context, f"ℹ️ *Log*: rifiutata ID {pid} da admin {admin_id}.")
 
 # -------------------- Application builder --------------------
 def build_application():
@@ -689,5 +686,5 @@ def build_application():
     app.add_handler(CommandHandler("reject", cmd_reject))
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    log.info("Handlers ready. WALLET-only accounting with proper handler chaining.")
+    log.info("Handlers ready. Wallet-only with photo prompt + notifications.")
     return app
