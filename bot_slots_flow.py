@@ -624,6 +624,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer("Rifiutata ❌", show_alert=True)
         await update.callback_query.message.reply_text(f"❌ Rifiutata ID {pid}", reply_markup=main_keyboard())
 
+
 def build_application():
     token = os.environ.get("TELEGRAM_TOKEN")
     if not token:
@@ -631,33 +632,40 @@ def build_application():
 
     app = Application.builder().token(token).build()
 
+    # Utente
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("saldo", cmd_saldo))
 
+    # Admin: credit wizard (TEXT handler first, block=False)
+    app.add_handler(CommandHandler("credita", cmd_credita))
+    app.add_handler(CallbackQueryHandler(ac_choose_user, pattern=r'^ac_user:'))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ac_input_kwh, block=False))
+
+    # Wizard ricarica
     app.add_handler(CommandHandler("ricarica", wizard_ricarica_start))
     app.add_handler(MessageHandler(filters.Regex(r'^\s*\+\s*Ricarica\s*$'), wizard_ricarica_start))
     app.add_handler(CallbackQueryHandler(wizard_choose_slot, pattern=r'^slot:'))
     app.add_handler(MessageHandler(filters.PHOTO, wizard_photo))
     app.add_handler(CallbackQueryHandler(wizard_declare_or_note, pattern=r'^decl:'))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, wizard_input_kwh))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, wizard_input_note))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, wizard_input_kwh, block=False))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, wizard_input_note, block=False))
 
-    app.add_handler(CommandHandler("credita", cmd_credita))
-    app.add_handler(CallbackQueryHandler(ac_choose_user, pattern=r'^ac_user:'))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ac_input_kwh))
-
+    # Catch-all text AFTER wizard/credit handlers
     async def _on_text_or_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if _wz(context) or _ac(context): return
+        if _wz(context) or _ac(context):
+            return
         await on_message(update, context)
+
     app.add_handler(CommandHandler("annulla", cmd_annulla))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text_or_note))
 
+    # Admin approvals & lists
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("approve", cmd_approve))
     app.add_handler(CommandHandler("reject", cmd_reject))
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    log.info("Handlers ready. WALLET-only accounting with confirmations.")
+    log.info("Handlers ready. WALLET-only accounting with proper handler chaining.")
     return app
