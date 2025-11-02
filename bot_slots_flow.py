@@ -1,9 +1,10 @@
-# bot_slots_flow.py — wallet-only accounting; slot kept as metadata
+# bot_slots_flow.py — WALLET-only accounting with confirmations
+# (This file replaces the previous version.)
 import os
 import pathlib
 import sqlite3
 import logging
-from typing import Optional, Tuple, List
+from typing import Optional, List
 
 from telegram import (
     Update, InlineKeyboardMarkup, InlineKeyboardButton,
@@ -17,7 +18,6 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot_slots_flow")
 
-# ===================== DB LAYER (safe for Railway volumes) =====================
 os.environ.setdefault("TMPDIR", "/var/data")
 os.environ.setdefault("TEMP", "/var/data")
 os.environ.setdefault("TMP", "/var/data")
@@ -30,11 +30,7 @@ PHOTOS_DIR = f"{DATA_DIR}/photos"
 
 def open_sqlite(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(
-        db_path,
-        timeout=30,
-        check_same_thread=False,
-        isolation_level=None,
-        cached_statements=0,
+        db_path, timeout=30, check_same_thread=False, isolation_level=None, cached_statements=0
     )
     cur = conn.cursor()
     cur.execute("PRAGMA journal_mode=OFF;")
@@ -50,97 +46,86 @@ class DB:
         p = (db_path_env or "").strip()
         self.path = p if p else DEFAULT_DB_PATH
 
-        dirpath = os.path.dirname(self.path) or DATA_DIR
-        pathlib.Path(dirpath).mkdir(parents=True, exist_ok=True)
+        pathlib.Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
         pathlib.Path(PHOTOS_DIR).mkdir(parents=True, exist_ok=True)
 
-        # write test
-        testfile = os.path.join(dirpath, ".rw_test")
         try:
-            with open(testfile, "w") as f:
+            with open(os.path.join(DATA_DIR, ".rw_test"), "w") as f:
                 f.write("ok")
-            os.remove(testfile)
-            log.info("DB dir write test OK on %s", dirpath)
+            os.remove(os.path.join(DATA_DIR, ".rw_test"))
         except Exception:
-            log.exception("DB dir write test FAILED on %s", dirpath)
+            log.exception("DB dir write test FAILED on %s", DATA_DIR)
 
-        self.conn: sqlite3.Connection = open_sqlite(self.path)
+        self.conn = open_sqlite(self.path)
         self._init_db()
 
     def _init_db(self):
-        try:
-            with self.conn as con:
-                cur = con.cursor()
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY,
-                    chat_id INTEGER UNIQUE,
-                    username TEXT,
-                    first_name TEXT,
-                    last_name TEXT,
-                    approved INTEGER DEFAULT 1,
-                    slot1_kwh REAL DEFAULT 0,   -- legacy (non usati nel conteggio)
-                    slot3_kwh REAL DEFAULT 0,
-                    slot5_kwh REAL DEFAULT 0,
-                    slot8_kwh REAL DEFAULT 0,
-                    wallet_kwh REAL DEFAULT 0,
-                    created_at TEXT,
-                    updated_at TEXT
-                );
-                """)
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS pending (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    slot_type TEXT,         -- solo per controllo
-                    kwh REAL,
-                    photo_path TEXT,
-                    note TEXT,
-                    requested_by INTEGER,
-                    status TEXT DEFAULT 'pending',
-                    approved_by INTEGER,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(user_id) REFERENCES users(id)
-                );
-                """)
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS recharges (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    amount REAL,
-                    slot_type TEXT,    -- solo per controllo
-                    approved INTEGER DEFAULT 0,
-                    approved_by INTEGER,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(user_id) REFERENCES users(id)
-                );
-                """)
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS notes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    text TEXT,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(user_id) REFERENCES users(id)
-                );
-                """)
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS admin_actions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    admin_id INTEGER,
-                    action TEXT,
-                    target_user_id INTEGER,
-                    note TEXT,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                );
-                """)
-                cur.close()
-            log.info("DB init OK on %s", self.path)
-        except sqlite3.OperationalError:
-            log.exception('DB init failed at %s', self.path)
-            raise
+        with self.conn as con:
+            cur = con.cursor()
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                chat_id INTEGER UNIQUE,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                approved INTEGER DEFAULT 1,
+                slot1_kwh REAL DEFAULT 0,
+                slot3_kwh REAL DEFAULT 0,
+                slot5_kwh REAL DEFAULT 0,
+                slot8_kwh REAL DEFAULT 0,
+                wallet_kwh REAL DEFAULT 0,
+                created_at TEXT,
+                updated_at TEXT
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS pending (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                slot_type TEXT,
+                kwh REAL,
+                photo_path TEXT,
+                note TEXT,
+                requested_by INTEGER,
+                status TEXT DEFAULT 'pending',
+                approved_by INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS recharges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount REAL,
+                slot_type TEXT,
+                approved INTEGER DEFAULT 0,
+                approved_by INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                text TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS admin_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER,
+                action TEXT,
+                target_user_id INTEGER,
+                note TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            """)
 
-    # ----------------- Convenience methods -----------------
     def get_or_create_user(self, chat_id: int, username: str, first_name: str, last_name: str) -> int:
         with self.conn as con:
             cur = con.cursor()
@@ -161,10 +146,24 @@ class DB:
             row = cur.fetchone()
             return row[0] if row else None
 
+    def get_chat_id_by_user_id(self, user_id: int) -> Optional[int]:
+        with self.conn as con:
+            cur = con.cursor()
+            cur.execute("SELECT chat_id FROM users WHERE id=?", (user_id,))
+            row = cur.fetchone()
+            return row[0] if row else None
+
     def get_wallet(self, chat_id: int) -> float:
         with self.conn as con:
             cur = con.cursor()
             cur.execute("SELECT wallet_kwh FROM users WHERE chat_id=?", (chat_id,))
+            row = cur.fetchone()
+            return float(row[0]) if row else 0.0
+
+    def get_wallet_by_user_id(self, user_id: int) -> float:
+        with self.conn as con:
+            cur = con.cursor()
+            cur.execute("SELECT wallet_kwh FROM users WHERE id=?", (user_id,))
             row = cur.fetchone()
             return float(row[0]) if row else 0.0
 
@@ -202,7 +201,6 @@ class DB:
             return cur.fetchall()
 
     def approve_pending(self, pending_id: int, admin_id: int) -> Optional[tuple]:
-        """Apply pending recharge to WALLET and mark approved. Returns (user_id, slot, kwh)"""
         with self.conn as con:
             cur = con.cursor()
             cur.execute("SELECT user_id, slot_type, kwh FROM pending WHERE id=? AND status='pending'", (pending_id,))
@@ -222,20 +220,17 @@ class DB:
             cur = con.cursor()
             cur.execute("UPDATE pending SET status='rejected', approved_by=? WHERE id=?", (admin_id, pending_id))
 
-# Create DB instance at import
+
 def _init_db_instance() -> DB:
     DB_PATH = os.environ.get("DB_PATH", DEFAULT_DB_PATH).strip()
     try:
-        db = DB(DB_PATH)
-        return db
+        return DB(DB_PATH)
     except Exception:
-        log.exception("DB init failed (path=%s). Falling back to in-memory for boot.", DB_PATH)
-        mem = DB(":memory:")
-        return mem
+        log.exception("DB init failed. Falling back to memory.")
+        return DB(":memory:")
 
 DBI = _init_db_instance()
 
-# ===================== Helpers & security =====================
 def _fmt_name(u: Update):
     chat_id = u.effective_chat.id if u.effective_chat else 0
     user = u.effective_user
@@ -259,102 +254,66 @@ def _admin_ids():
     except ValueError:
         return []
 
-# ---------- Reply Keyboard (sempre visibile) ----------
 def main_keyboard():
-    rows = [
-        [KeyboardButton("+ Ricarica")],
-        [KeyboardButton("/saldo"), KeyboardButton("/annulla")],
-    ]
+    rows = [[KeyboardButton("+ Ricarica")],[KeyboardButton("/saldo"), KeyboardButton("/annulla")]]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
-# ===================== User Handlers (base) =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id, username, first_name, last_name = _fmt_name(update)
     DBI.get_or_create_user(chat_id, username, first_name, last_name)
-    if update.message:
-        await update.message.reply_text(
-            "Ciao! ✅ Bot attivo. Inviami un comando o un messaggio.\n"
-            "Comandi: /saldo, /ricarica, /help",
-            reply_markup=main_keyboard()
-        )
+    await update.message.reply_text("Ciao! ✅ Bot attivo. Comandi: /saldo, /ricarica, /help", reply_markup=main_keyboard())
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "ℹ️ *Comandi disponibili*\n"
-        "• /saldo — mostra il tuo *Wallet*\n"
-        "• /ricarica `<slot1|slot3|slot5|slot8|wallet>` `<kwh>` — invia richiesta (scorciatoia)\n"
-        "• *Wizard ricarica*: premi “+ Ricarica” e segui i passi\n"
-        "• Invia *foto* con didascalia: `slot3 4.5` per allegare prova (slot usato solo come controllo)\n\n"
-        "👮 *Admin*:\n"
-        "• /pending — elenca richieste in attesa\n"
-        "• /approve `<id>` — approva richiesta (somma al Wallet)\n"
-        "• /reject `<id>` — rifiuta richiesta\n"
-        "• /users — ultimi utenti con saldi\n"
-        "• /credita — wizard per accrediti (somma al Wallet)",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard()
+        "ℹ️ *Comandi*\n"
+        "• /saldo — *Wallet*\n"
+        "• /ricarica `<slot1|slot3|slot5|slot8|wallet>` `<kwh>` (scorciatoia) oppure “+ Ricarica”\n"
+        "👮 Admin: /pending, /approve `<id>`, /reject `<id>`, /users, /credita",
+        parse_mode="Markdown", reply_markup=main_keyboard()
     )
 
 async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id, username, first_name, last_name = _fmt_name(update)
     DBI.get_or_create_user(chat_id, username, first_name, last_name)
     wallet = DBI.get_wallet(chat_id)
-    msg = f"💼 *Wallet*: *{wallet}* kWh"
-    if update.message:
-        await update.message.reply_markdown(msg, reply_markup=main_keyboard())
+    await update.message.reply_markdown(f"💼 *Wallet*: *{wallet}* kWh", reply_markup=main_keyboard())
 
-# Scorciatoia /ricarica <slot> <kwh>
 async def cmd_ricarica(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id, username, first_name, last_name = _fmt_name(update)
     user_id = DBI.get_or_create_user(chat_id, username, first_name, last_name)
 
     args = context.args or []
     if len(args) != 2:
-        await update.message.reply_text("Usa: /ricarica <slot1|slot3|slot5|slot8|wallet> <kwh> oppure premi “+ Ricarica”.",
-                                        reply_markup=main_keyboard())
-        return
+        await update.message.reply_text("Usa: /ricarica <slot1|slot3|slot5|slot8|wallet> <kwh>", reply_markup=main_keyboard()); return
     slot = args[0].lower().strip()
-    try:
-        kwh = float(args[1].replace(",", "."))
+    try: kwh = float(args[1].replace(",", "."))
     except ValueError:
-        await update.message.reply_text("KWh non valido. Esempio: /ricarica slot3 4.5", reply_markup=main_keyboard())
-        return
+        await update.message.reply_text("KWh non valido. Es: /ricarica slot3 4.5", reply_markup=main_keyboard()); return
     if slot not in ("slot1","slot3","slot5","slot8","wallet"):
-        await update.message.reply_text("Slot non valido. Usa: slot1, slot3, slot5, slot8, wallet", reply_markup=main_keyboard())
-        return
+        await update.message.reply_text("Slot non valido.", reply_markup=main_keyboard()); return
 
     pid = DBI.add_pending_recharge(user_id, slot, kwh, None, requested_by=chat_id)
     await update.message.reply_text(
-        f"Richiesta creata (ID *{pid}*): `{slot}` +*{kwh}* kWh → *Wallet*.\nIn attesa di approvazione.",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard()
+        f"Richiesta creata (ID *{pid}*): `{slot}` +*{kwh}* kWh → *Wallet* (in attesa).",
+        parse_mode="Markdown", reply_markup=main_keyboard()
     )
-    await _notify_admins_new_pending(context, pid, user_id, slot, kwh, note="", photo_path=None)
+    await _notify_admins_new_pending(context, pid, user_id, slot, kwh, "", None)
 
-# Foto con didascalia “slot3 4.5” (fallback)
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id, username, first_name, last_name = _fmt_name(update)
     user_id = DBI.get_or_create_user(chat_id, username, first_name, last_name)
-
     photo = update.message.photo[-1] if update.message and update.message.photo else None
     caption = (update.message.caption or "").strip() if update.message else ""
-    if not photo or not caption:
-        return
-
+    if not photo or not caption: return
     parts = caption.split()
     if len(parts) != 2:
-        await update.message.reply_text("Didascalia non valida. Usa: `slot3 4.5`", parse_mode="Markdown",
-                                        reply_markup=main_keyboard())
-        return
+        await update.message.reply_text("Didascalia non valida. Usa: `slot3 4.5`", parse_mode="Markdown", reply_markup=main_keyboard()); return
     slot = parts[0].lower()
-    try:
-        kwh = float(parts[1].replace(",", "."))
+    try: kwh = float(parts[1].replace(",", "."))
     except ValueError:
-        await update.message.reply_text("KWh non valido nella didascalia.", reply_markup=main_keyboard())
-        return
+        await update.message.reply_text("KWh non valido.", reply_markup=main_keyboard()); return
     if slot not in ("slot1","slot3","slot5","slot8","wallet"):
-        await update.message.reply_text("Slot non valido nella didascalia.", reply_markup=main_keyboard())
-        return
+        await update.message.reply_text("Slot non valido.", reply_markup=main_keyboard()); return
 
     file_id = photo.file_id
     file = await context.bot.get_file(file_id)
@@ -362,12 +321,8 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await file.download_to_drive(local_path)
 
     pid = DBI.add_pending_recharge(user_id, slot, kwh, local_path, requested_by=chat_id, note="foto")
-    await update.message.reply_text(
-        f"📎 Ricevuta registrata. Richiesta *{pid}*: `{slot}` +*{kwh}* kWh → *Wallet*.",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard()
-    )
-    await _notify_admins_new_pending(context, pid, user_id, slot, kwh, note="foto", photo_path=local_path)
+    await update.message.reply_text(f"📎 Ricevuta registrata. Richiesta *{pid}*.", parse_mode="Markdown", reply_markup=main_keyboard())
+    await _notify_admins_new_pending(context, pid, user_id, slot, kwh, "foto", local_path)
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id, username, first_name, last_name = _fmt_name(update)
@@ -376,102 +331,91 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.startswith("/"):
         return
     DBI.add_note(user_id, text)
-    await update.message.reply_text("📝 Nota salvata. (Digita /saldo per vedere il Wallet)",
-                                    reply_markup=main_keyboard())
+    await update.message.reply_text("📝 Nota salvata.", reply_markup=main_keyboard())
 
-# ===================== Admin Handlers =====================
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not _is_admin(chat_id):
-        await update.message.reply_text("⛔ Solo admin.", reply_markup=main_keyboard())
-        return
+    if not _is_admin(update.effective_chat.id):
+        await update.message.reply_text("⛔ Solo admin.", reply_markup=main_keyboard()); return
     rows = DBI.list_users(limit=30)
     if not rows:
-        await update.message.reply_text("Nessun utente.", reply_markup=main_keyboard())
-        return
+        await update.message.reply_text("Nessun utente.", reply_markup=main_keyboard()); return
     lines = []
     for r in rows:
-        uid, cid, un, fn, ln, s1, s3, s5, s8, wal = r
+        uid, cid, un, fn, ln, *_slots, wal = r
         name = un or (fn + " " + ln).strip() or str(cid)
         lines.append(f"• #{uid} {name} — Wallet:{wal}")
     await update.message.reply_text("👥 *Utenti*\n" + "\n".join(lines), parse_mode="Markdown", reply_markup=main_keyboard())
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not _is_admin(chat_id):
-        await update.message.reply_text("⛔ Solo admin.", reply_markup=main_keyboard())
-        return
+    if not _is_admin(update.effective_chat.id):
+        await update.message.reply_text("⛔ Solo admin.", reply_markup=main_keyboard()); return
     rows = DBI.list_pending()
     if not rows:
-        await update.message.reply_text("Nessuna richiesta in attesa.", reply_markup=main_keyboard())
-        return
-    lines = []
-    kb = []
+        await update.message.reply_text("Nessuna richiesta in attesa.", reply_markup=main_keyboard()); return
+    lines, kb = [], []
     for r in rows:
         pid, user_id, slot, kwh, path, note, status, created = r
         lines.append(f"• ID {pid}: user#{user_id} {slot}+{kwh} kWh → Wallet [{status}]")
-        kb.append([
-            InlineKeyboardButton(f"✅ Approva {pid}", callback_data=f"approve:{pid}"),
-            InlineKeyboardButton(f"❌ Rifiuta {pid}", callback_data=f"reject:{pid}")
-        ])
-    await update.message.reply_text("🕘 *Pending*\n" + "\n".join(lines), parse_mode="Markdown",
-                                    reply_markup=InlineKeyboardMarkup(kb))
+        kb.append([InlineKeyboardButton(f"✅ Approva {pid}", callback_data=f"approve:{pid}"),
+                   InlineKeyboardButton(f"❌ Rifiuta {pid}", callback_data=f"reject:{pid}")])
+    await update.message.reply_text("🕘 *Pending*\n" + "\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+
+async def _notify_user_wallet(context: ContextTypes.DEFAULT_TYPE, user_id: int, add_kwh: float):
+    chat_id = DBI.get_chat_id_by_user_id(user_id)
+    if not chat_id: return
+    wallet = DBI.get_wallet_by_user_id(user_id)
+    txt = f"✅ Ricarica *approvata*: +*{add_kwh}* kWh → Wallet.\nSaldo attuale: *{wallet}* kWh"
+    try:
+        await context.bot.send_message(chat_id, txt, parse_mode="Markdown", reply_markup=main_keyboard())
+    except Exception:
+        log.exception("Notify user failed")
 
 async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not _is_admin(chat_id):
-        await update.message.reply_text("⛔ Solo admin.", reply_markup=main_keyboard())
-        return
+    admin_id = update.effective_chat.id
+    if not _is_admin(admin_id):
+        await update.message.reply_text("⛔ Solo admin.", reply_markup=main_keyboard()); return
     args = context.args or []
     if len(args) != 1 or not args[0].isdigit():
-        await update.message.reply_text("Usa: /approve <id>", reply_markup=main_keyboard())
-        return
+        await update.message.reply_text("Usa: /approve <id>", reply_markup=main_keyboard()); return
     pid = int(args[0])
-    res = DBI.approve_pending(pid, admin_id=chat_id)
+    res = DBI.approve_pending(pid, admin_id=admin_id)
     if not res:
-        await update.message.reply_text("Richiesta non trovata o già gestita.", reply_markup=main_keyboard())
-        return
+        await update.message.reply_text("Richiesta non trovata o già gestita.", reply_markup=main_keyboard()); return
     user_id, slot, kwh = res
-    await update.message.reply_text(f"✅ Approvata ID {pid}: user#{user_id} {slot}+{kwh} kWh → Wallet", reply_markup=main_keyboard())
+    await update.message.reply_text(f"✅ Approvata ID {pid}: user#{user_id} {slot}+{kwh} → Wallet", reply_markup=main_keyboard())
+    await _notify_user_wallet(context, user_id, kwh)
 
 async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not _is_admin(chat_id):
-        await update.message.reply_text("⛔ Solo admin.", reply_markup=main_keyboard())
-        return
+    admin_id = update.effective_chat.id
+    if not _is_admin(admin_id):
+        await update.message.reply_text("⛔ Solo admin.", reply_markup=main_keyboard()); return
     args = context.args or []
     if len(args) != 1 or not args[0].isdigit():
-        await update.message.reply_text("Usa: /reject <id>", reply_markup=main_keyboard())
-        return
+        await update.message.reply_text("Usa: /reject <id>", reply_markup=main_keyboard()); return
     pid = int(args[0])
-    DBI.reject_pending(pid, admin_id=chat_id)
+    DBI.reject_pending(pid, admin_id=admin_id)
     await update.message.reply_text(f"❌ Rifiutata ID {pid}", reply_markup=main_keyboard())
 
-# ---------- Admin Credit Wizard (wallet-only) ----------
+# Admin credit wizard
 AC_KEY = "admin_credit_wz"
-AC_EXPECT = "expect"         # 'user' | 'kwh'
-AC_DATA = "data"             # {'chat_id':..., 'kwh':...}
+AC_EXPECT = "expect"
+AC_DATA = "data"
 
 def _ac_reset(context): context.user_data.pop(AC_KEY, None)
 def _ac_start(context): context.user_data[AC_KEY] = {AC_EXPECT: "user", AC_DATA: {}}
 def _ac(context): return context.user_data.get(AC_KEY, None)
 
 async def cmd_credita(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not _is_admin(chat_id):
-        await update.message.reply_text("⛔ Solo admin.", reply_markup=main_keyboard())
-        return
-
+    if not _is_admin(update.effective_chat.id):
+        await update.message.reply_text("⛔ Solo admin.", reply_markup=main_keyboard()); return
     _ac_start(context)
     rows = DBI.list_users(limit=20)
     if not rows:
         await update.message.reply_text("Nessun utente trovato.", reply_markup=main_keyboard()); return
-
     buttons = []
     for (uid, cid, un, fn, ln, *_rest) in rows:
         name = un or (fn + " " + ln).strip() or str(cid)
         buttons.append([InlineKeyboardButton(f"{name} ({cid})", callback_data=f"ac_user:{cid}")])
-
     await update.message.reply_text("👤 Seleziona l'utente da accreditare (Wallet):", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def ac_choose_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -479,15 +423,12 @@ async def ac_choose_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = update.callback_query.data or ""
     if not data.startswith("ac_user:"): return
     cid_s = data.split(":",1)[1]
-    try:
-        cid = int(cid_s)
+    try: cid = int(cid_s)
     except ValueError:
         await update.callback_query.answer("chat_id non valido", show_alert=True); return
-
     wz = _ac(context)
     if not wz or wz[AC_EXPECT] != "user":
         await update.callback_query.answer("Sessione scaduta. /credita", show_alert=True); return
-
     wz[AC_DATA]["chat_id"] = cid
     wz[AC_EXPECT] = "kwh"
     await update.callback_query.answer()
@@ -498,71 +439,31 @@ async def ac_choose_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ac_input_kwh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wz = _ac(context)
-    if not wz or wz[AC_EXPECT] != "kwh": 
-        return
-
+    if not wz or wz[AC_EXPECT] != "kwh": return
     txt = (update.message.text or "").strip()
-    try:
-        kwh = float(txt.replace(",", "."))
+    try: kwh = float(txt.replace(",", "."))
     except ValueError:
-        await update.message.reply_text("Valore non valido. Inserisci un numero (es: 2.0).", reply_markup=main_keyboard()); 
-        return
-
+        await update.message.reply_text("Valore non valido. Inserisci un numero (es: 2.0).", reply_markup=main_keyboard()); return
     cid = wz[AC_DATA]["chat_id"]
     admin_chat = update.effective_chat.id
-
     uid = DBI.get_user_id(cid) or DBI.get_or_create_user(cid, "", "", "")
     pid = DBI.add_pending_recharge(uid, "wallet", kwh, None, requested_by=admin_chat, note="accredito admin")
     res = DBI.approve_pending(pid, admin_id=admin_chat)
     _ac_reset(context)
-
     if res:
-        await update.message.reply_text(
-            f"✅ Accreditati *{kwh}* kWh sul *Wallet* dell'utente *{cid}*.",
-            parse_mode="Markdown", reply_markup=main_keyboard()
-        )
+        await update.message.reply_text(f"✅ Accreditati *{kwh}* kWh sul *Wallet* dell'utente *{cid}*.", parse_mode="Markdown", reply_markup=main_keyboard())
+        await _notify_user_wallet(context, uid, kwh)
     else:
         await update.message.reply_text("Errore in accredito.", reply_markup=main_keyboard())
 
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.callback_query:
-        return
-    data = update.callback_query.data or ""
-    if not data or ":" not in data:
-        await update.callback_query.answer()
-        return
-    action, pid_s = data.split(":", 1)
-    chat_id = update.effective_chat.id
-    if not _is_admin(chat_id):
-        await update.callback_query.answer("Solo admin", show_alert=True)
-        return
-    if not pid_s.isdigit():
-        await update.callback_query.answer("ID non valido", show_alert=True)
-        return
-    pid = int(pid_s)
-    if action == "approve":
-        res = DBI.approve_pending(pid, admin_id=chat_id)
-        if res:
-            await update.callback_query.answer("Approvata ✅", show_alert=True)
-        else:
-            await update.callback_query.answer("Già gestita/inesistente", show_alert=True)
-    elif action == "reject":
-        DBI.reject_pending(pid, admin_id=chat_id)
-        await update.callback_query.answer("Rifiutata ❌", show_alert=True)
-
-# ===================== Wizard Ricarica (slot per controllo; somma al wallet) =====================
+# Wizard ricarica
 WZ_KEY = "ricarica_wz"
 WZ_EXPECT = "expect"
 WZ_DATA = "data"
 
-def _wz_reset(context):
-    context.user_data.pop(WZ_KEY, None)
-
-def _wz_start(context):
-    context.user_data[WZ_KEY] = {WZ_EXPECT: "slot", WZ_DATA: {}}
-
-def _wz(context):
-    return context.user_data.get(WZ_KEY, None)
+def _wz_reset(context): context.user_data.pop(WZ_KEY, None)
+def _wz_start(context): context.user_data[WZ_KEY] = {WZ_EXPECT: "slot", WZ_DATA: {}}
+def _wz(context): return context.user_data.get(WZ_KEY, None)
 
 async def _notify_admins_new_pending(context: ContextTypes.DEFAULT_TYPE, pid: int, user_id: int, slot: str, kwh: float, note: str, photo_path: str|None):
     kb = InlineKeyboardMarkup([[
@@ -590,113 +491,84 @@ async def _notify_admins_new_pending(context: ContextTypes.DEFAULT_TYPE, pid: in
 async def wizard_ricarica_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and context.args:
         return await cmd_ricarica(update, context)
-
     _wz_start(context)
     kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Slot1", callback_data="slot:slot1"),
-            InlineKeyboardButton("Slot3", callback_data="slot:slot3"),
-        ],
-        [
-            InlineKeyboardButton("Slot5", callback_data="slot:slot5"),
-            InlineKeyboardButton("Slot8", callback_data="slot:slot8"),
-        ],
+        [InlineKeyboardButton("Slot1", callback_data="slot:slot1"),
+         InlineKeyboardButton("Slot3", callback_data="slot:slot3")],
+        [InlineKeyboardButton("Slot5", callback_data="slot:slot5"),
+         InlineKeyboardButton("Slot8", callback_data="slot:slot8")],
         [InlineKeyboardButton("Wallet", callback_data="slot:wallet")]
     ])
     await update.message.reply_text(
-        "Seleziona lo *slot usato* (solo per controllo, kWh andranno nel *Wallet*):",
-        parse_mode="Markdown",
-        reply_markup=kb
+        "Seleziona lo *slot usato* (solo per controllo, i kWh andranno nel *Wallet*):",
+        parse_mode="Markdown", reply_markup=kb
     )
 
 async def wizard_choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.callback_query:
-        return
+    if not update.callback_query: return
     data = update.callback_query.data or ""
-    if not data.startswith("slot:"):
-        return
+    if not data.startswith("slot:"): return
     slot = data.split(":",1)[1]
     wz = _wz(context)
     if not wz:
-        await update.callback_query.answer("Sessione scaduta. Premi + Ricarica.", show_alert=True)
-        return
+        await update.callback_query.answer("Sessione scaduta. Premi + Ricarica.", show_alert=True); return
     wz[WZ_DATA]["slot"] = slot
     wz[WZ_EXPECT] = "kwh"
     await update.callback_query.answer()
     await update.callback_query.message.reply_text(
         f"Hai scelto *{slot}*.\nOra *inserisci i kWh* (es: 4.5):",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard()
+        parse_mode="Markdown", reply_markup=main_keyboard()
     )
 
 async def wizard_input_kwh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wz = _wz(context)
-    if not wz or wz.get(WZ_EXPECT) != "kwh":
-        return
+    if not wz or wz.get(WZ_EXPECT) != "kwh": return
     txt = (update.message.text or "").strip()
-    try:
-        kwh = float(txt.replace(",", "."))
+    try: kwh = float(txt.replace(",", "."))
     except ValueError:
-        await update.message.reply_text("Valore non valido. Inserisci i kWh (es: 4.5).", reply_markup=main_keyboard())
-        return
+        await update.message.reply_text("Valore non valido. Inserisci i kWh (es: 4.5).", reply_markup=main_keyboard()); return
     wz[WZ_DATA]["kwh"] = kwh
     wz[WZ_EXPECT] = "photo"
     await update.message.reply_text(
         f"Riepilogo provvisorio:\n• Slot: {wz[WZ_DATA]['slot']}\n• kWh {kwh}\n\nOra *invia la foto* della ricarica.",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard()
+        parse_mode="Markdown", reply_markup=main_keyboard()
     )
 
 async def wizard_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wz = _wz(context)
-    if not wz or wz.get(WZ_EXPECT) != "photo":
-        return
+    if not wz or wz.get(WZ_EXPECT) != "photo": return
     photo = update.message.photo[-1] if update.message and update.message.photo else None
-    if not photo:
-        return
+    if not photo: return
     file = await context.bot.get_file(photo.file_id)
     local_path = f"{PHOTOS_DIR}/{photo.file_id}.jpg"
     await file.download_to_drive(local_path)
     wz[WZ_DATA]["photo_path"] = local_path
     wz[WZ_EXPECT] = "choose_action"
-
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📨 Dichiara senza nota", callback_data="decl:send"),
-            InlineKeyboardButton("📝 Aggiungi nota", callback_data="decl:note"),
-        ]
-    ])
-    await update.message.reply_text(
-        "Foto acquisita.\nVuoi *dichiarare subito* o *aggiungere una nota*?",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📨 Dichiara senza nota", callback_data="decl:send"),
+        InlineKeyboardButton("📝 Aggiungi nota", callback_data="decl:note"),
+    ]])
+    await update.message.reply_text("Foto acquisita. Dichiari subito o aggiungi una nota?", reply_markup=kb)
 
 async def wizard_declare_or_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.callback_query:
-        return
+    if not update.callback_query: return
     data = update.callback_query.data or ""
-    if not data.startswith("decl:"):
-        return
+    if not data.startswith("decl:"): return
     choice = data.split(":",1)[1]
     wz = _wz(context)
-    if not wz or wz.get(WZ_EXPECT) not in ("choose_action", "note"):
-        await update.callback_query.answer("Sessione scaduta. Premi + Ricarica.", show_alert=True)
-        return
-
+    if not wz or wz.get(WZ_EXPECT) not in ("choose_action","note"):
+        await update.callback_query.answer("Sessione scaduta. Premi + Ricarica.", show_alert=True); return
     if choice == "note":
         wz[WZ_EXPECT] = "note"
         await update.callback_query.answer()
         await update.callback_query.message.reply_text("Scrivi la *nota* da allegare:", parse_mode="Markdown")
         return
-
     await update.callback_query.answer()
     await _wizard_finalize(update, context, note="")
 
 async def wizard_input_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wz = _wz(context)
-    if not wz or wz.get(WZ_EXPECT) != "note":
-        return
+    if not wz or wz.get(WZ_EXPECT) != "note": return
     note = (update.message.text or "").strip()
     await _wizard_finalize(update, context, note=note)
 
@@ -704,16 +576,12 @@ async def _wizard_finalize(update_or_cb, context: ContextTypes.DEFAULT_TYPE, not
     wz = _wz(context)
     chat_id, username, first_name, last_name = _fmt_name(update_or_cb)
     user_id = DBI.get_or_create_user(chat_id, username, first_name, last_name)
-
     slot = wz[WZ_DATA]["slot"]
     kwh = wz[WZ_DATA]["kwh"]
     photo_path = wz[WZ_DATA].get("photo_path")
-
     pid = DBI.add_pending_recharge(user_id, slot, kwh, photo_path, requested_by=chat_id, note=note)
     _wz_reset(context)
-
     await _notify_admins_new_pending(context, pid, user_id, slot, kwh, note, photo_path)
-
     msg = (
         f"✅ Dichiarazione inviata (ID *{pid}*): slot *{slot}* +*{kwh}* kWh → *Wallet*\n"
         + (f"📝 Nota: _{note}_\n" if note else "")
@@ -726,14 +594,36 @@ async def _wizard_finalize(update_or_cb, context: ContextTypes.DEFAULT_TYPE, not
 
 async def cmd_annulla(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cleared = False
-    if _ac(context):
-        _ac_reset(context); cleared = True
-    if _wz(context):
-        _wz_reset(context); cleared = True
-    await update.message.reply_text("❎ Operazione annullata." if cleared else "Nessuna operazione in corso.",
-                                    reply_markup=main_keyboard())
+    if _ac(context): _ac_reset(context); cleared = True
+    if _wz(context): _wz_reset(context); cleared = True
+    await update.message.reply_text("❎ Operazione annullata." if cleared else "Nessuna operazione in corso.", reply_markup=main_keyboard())
 
-# ===================== Application builder (used by FastAPI) =====================
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.callback_query: return
+    data = update.callback_query.data or ""
+    if ":" not in data: 
+        await update.callback_query.answer(); return
+    action, pid_s = data.split(":", 1)
+    admin_id = update.effective_chat.id
+    if not _is_admin(admin_id):
+        await update.callback_query.answer("Solo admin", show_alert=True); return
+    if not pid_s.isdigit():
+        await update.callback_query.answer("ID non valido", show_alert=True); return
+    pid = int(pid_s)
+    if action == "approve":
+        res = DBI.approve_pending(pid, admin_id=admin_id)
+        if res:
+            user_id, slot, kwh = res
+            await update.callback_query.answer("Approvata ✅", show_alert=True)
+            await update.callback_query.message.reply_text(f"✅ Approvata ID {pid}: user#{user_id} {slot}+{kwh} → Wallet", reply_markup=main_keyboard())
+            await _notify_user_wallet(context, user_id, kwh)
+        else:
+            await update.callback_query.answer("Già gestita/inesistente", show_alert=True)
+    elif action == "reject":
+        DBI.reject_pending(pid, admin_id=admin_id)
+        await update.callback_query.answer("Rifiutata ❌", show_alert=True)
+        await update.callback_query.message.reply_text(f"❌ Rifiutata ID {pid}", reply_markup=main_keyboard())
+
 def build_application():
     token = os.environ.get("TELEGRAM_TOKEN")
     if not token:
@@ -741,12 +631,10 @@ def build_application():
 
     app = Application.builder().token(token).build()
 
-    # Utente
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("saldo", cmd_saldo))
 
-    # Wizard ricarica
     app.add_handler(CommandHandler("ricarica", wizard_ricarica_start))
     app.add_handler(MessageHandler(filters.Regex(r'^\s*\+\s*Ricarica\s*$'), wizard_ricarica_start))
     app.add_handler(CallbackQueryHandler(wizard_choose_slot, pattern=r'^slot:'))
@@ -755,25 +643,21 @@ def build_application():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, wizard_input_kwh))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, wizard_input_note))
 
-    # Admin: credit wizard (wallet-only)
     app.add_handler(CommandHandler("credita", cmd_credita))
     app.add_handler(CallbackQueryHandler(ac_choose_user, pattern=r'^ac_user:'))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ac_input_kwh))
 
-    # Catch-all testo (note) — dopo gli step dei wizard
     async def _on_text_or_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if _wz(context) or _ac(context):
-            return
+        if _wz(context) or _ac(context): return
         await on_message(update, context)
     app.add_handler(CommandHandler("annulla", cmd_annulla))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text_or_note))
 
-    # Admin pending/approve/reject
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("approve", cmd_approve))
     app.add_handler(CommandHandler("reject", cmd_reject))
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    log.info("Handlers ready. Accounting = WALLET only (slots kept as metadata).")
+    log.info("Handlers ready. WALLET-only accounting with confirmations.")
     return app
