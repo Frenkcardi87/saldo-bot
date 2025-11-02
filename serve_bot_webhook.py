@@ -1,3 +1,18 @@
+import os, pathlib, logging
+log = logging.getLogger(__name__)
+
+DB_DIR = "/var/data"
+pathlib.Path(DB_DIR).mkdir(parents=True, exist_ok=True)
+
+# Forza i tmp di processo e SQLite nel volume (evita /tmp o dir read-only)
+os.environ.setdefault("TMPDIR", DB_DIR)
+os.environ.setdefault("TEMP", DB_DIR)
+os.environ.setdefault("TMP", DB_DIR)
+os.environ.setdefault("SQLITE_TMPDIR", DB_DIR)
+
+DB_PATH = os.getenv("DB_PATH", "/var/data/kwh_slots.db")
+log.info("DB_PATH=%s | TMPDIR=%s", DB_PATH, os.getenv("TMPDIR"))
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os, logging
