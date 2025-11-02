@@ -360,13 +360,29 @@ async def cmd_ping(update, context):
     await update.message.reply_text("pong")
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import logging
     user = update.effective_user
-    DBI.ensure_user(user)
+    try:
+        DBI.ensure_user(user)
+    except Exception as e:
+        logging.exception("ensure_user failed: %s", e)
+        await update.message.reply_text("⚠️ Errore DB in registrazione. Provo comunque a mostrarti il menu.")
     buttons = [*MENU_USER.inline_keyboard]
     if is_admin(user.id):
         buttons += MENU_ADMIN_EXTRAS
-    await smart_reply(update, context, "*Benvenuto!*\nSeleziona un'azione dal menu.", InlineKeyboardMarkup(buttons))
+    try:
+        await smart_reply(update, context, "*Benvenuto!*\nSeleziona un'azione dal menu.", InlineKeyboardMarkup(buttons))
+    except Exception as e:
+        logging.exception("send menu failed: %s", e)
+        await update.message.reply_text("⚠️ Errore nell'invio del menu. Riprova /menu")
 
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    buttons = [*MENU_USER.inline_keyboard]
+    if is_admin(user.id):
+        buttons += MENU_ADMIN_EXTRAS
+    await smart_reply(update, context, "*Menu*", InlineKeyboardMarkup(buttons))
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -834,6 +850,7 @@ def build_application() -> Application:
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("saldo", cmd_saldo))
