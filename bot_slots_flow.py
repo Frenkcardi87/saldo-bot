@@ -476,21 +476,26 @@ async def on_message_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ud["awaiting_wallet_kwh_for"] = None; await update.message.reply_text(f"Wallet approvato ✅ (+{amount} kWh)")
         await context.bot.send_message(chat_id=req["user_id"], text=f"La tua richiesta wallet #{wid} è stata *approvata*: +{amount} kWh", parse_mode=ParseMode.MARKDOWN); return
     if is_admin(update.effective_user.id) and ud.get("awaiting_delete_user"):
-val = re.sub(r"[^0-9]", "", text)
-if not val:
-    return await update.message.reply_text("Invia un ID numerico valido dell'utente da eliminare.")
-        target_id = int(val); ud["awaiting_delete_user"] = False; ud["awaiting_delete_user_confirm"] = target_id
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Sì, elimina", callback_data=f"userdel:yes:{target_id}")],[InlineKeyboardButton("❌ No", callback_data=f"userdel:no:{target_id}")]])
-        return await update.message.reply_text(f"Confermi eliminazione utente `{target_id}`?", parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-    if ud.get("decl_await_kwh"):
-        amount = _parse_positive_decimal(text)
-        if not amount: return await update.message.reply_text("Per favore inserisci un *numero* kWh valido (>0).", parse_mode=ParseMode.MARKDOWN)
-        ud["decl_kwh"] = str(amount); ud["decl_await_kwh"] = False; ud["decl_await_photo"] = True
-        return await update.message.reply_text("Ora invia *la foto della ricevuta* (obbligatoria).", parse_mode=ParseMode.MARKDOWN)
-    if ud.get("decl_await_note"):
-        ud["decl_note"] = text[:500]; ud["decl_await_note"] = False
-        return await ask_slot_choice(update, context)
-    await update.message.reply_text("Comando non riconosciuto. Usa /help o il menu.")
+    val = re.sub(r"[^0-9]", "", text)
+    if not val:
+        return await update.message.reply_text(
+            "Invia un ID numerico valido dell'utente da eliminare."
+        )
+
+    target_id = int(val)
+    ud["awaiting_delete_user"] = False
+    ud["awaiting_delete_user_confirm"] = target_id
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Sì, elimina", callback_data=f"userdel:yes:{target_id}")],
+        [InlineKeyboardButton("❌ No", callback_data=f"userdel:no:{target_id}")],
+    ])
+    return await update.message.reply_text(
+        f"Confermi eliminazione utente `{target_id}`?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+
 
 async def on_message_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ud = context.user_data
