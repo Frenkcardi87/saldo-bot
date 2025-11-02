@@ -1,26 +1,27 @@
 
 # bot_slots_flow.py
 # PTB 21.6 – Async
+# ==============================================
 # Features:
 # - Admin menu with ➕ Ricarica (credit) and ➖ Addebita (debit)
 # - Conversation flows with user selection (list + search), amount, optional slot, confirm
-# - SQLite (aiosqlite) with users, kwh_operations, per-user allow_negative override
+# - SQLite (aiosqlite) with users, kwh_operations, per-user allow_negative override (with global fallback)
 # - /saldo (user & admin), /storico (user), /export_ops (admin CSV), /addebita (admin)
 # - /allow_negative <user_id> on|off|default + inline buttons to toggle
+# - Safe DB migrations for existing DBs (PRAGMA table_info)
+# - Global error handler for PTB
 #
 # Build entrypoint: build_application()  -> returns PTB Application ready with handlers
 #
 # Env:
 #   TELEGRAM_TOKEN
 #   ADMIN_IDS          (e.g. "111,222")
-#   DB_PATH            (default: kwh_slots.db)
+#   DB_PATH            (default: kwh_slots.db; es. Railway volume: /data/kwh_slots.db)
 #   MAX_WALLET_KWH     (default: 100000)
 #   MAX_CREDIT_PER_OP  (default: 50000)
 #   ALLOW_NEGATIVE     (default: "0" / False)
 #
-# Notes:
-# - This module does not set webhook/polling itself. Import build_application() from your server.
-# - Requires: python-telegram-bot==21.6, aiosqlite
+# Requires: python-telegram-bot==21.6, aiosqlite, fastapi/uvicorn (per server esterno)
 
 import os
 import io
@@ -43,6 +44,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.error import TelegramError
 
 # ---------- Config & Defaults ----------
 
@@ -71,20 +73,22 @@ def _admin_ids() -> set[int]:
 
 ADMIN_IDS = _admin_ids()
 
-TZ = timezone(timedelta(hours=1))  # Europe/Rome (simple; you can adopt zoneinfo for DST)
+TZ = timezone(timedelta(hours=1))  # Europe/Rome (simple; adopt zoneinfo for DST if needed)
 
-# ---------- DB Init / Migration ----------
+# ---------- Safe migrations ----------
+
+async def _get_table_columns(db, table: str) -> set[str]:
+    cols = set()
+    async with db.execute(f"PRAGMA table_info({table})") as cur:
+        async for row in cur:
+            # PRAGMA table_info: cid, name, type, notnull, dflt_value, pk
+            cols.add(row[1])
+    return cols
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
-            tg_id INTEGER UNIQUE,
-            full_name TEXT,
-            wallet_kwh REAL NOT NULL DEFAULT 0,
-            allow_negative_user INTEGER       -- NULL=default global, 0=no, 1=yes
-        )""")
+        # 1) Ensure tables exist (minimal schemas)
+        await db.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY)")
         await db.execute("""
         CREATE TABLE IF NOT EXISTS kwh_operations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,6 +100,25 @@ async def init_db():
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY(user_id) REFERENCES users(id)
         )""")
+        await db.commit()
+
+        # 2) Users columns migration (add missing columns safely)
+        cols = await _get_table_columns(db, "users")
+        if "tg_id" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN tg_id INTEGER UNIQUE")
+        if "full_name" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN full_name TEXT")
+        if "wallet_kwh" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN wallet_kwh REAL NOT NULL DEFAULT 0")
+        if "allow_negative_user" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN allow_negative_user INTEGER")
+        await db.commit()
+
+        # 3) Backfill defaults
+        await db.execute("UPDATE users SET wallet_kwh=0 WHERE wallet_kwh IS NULL")
+        await db.commit()
+
+        # 4) Indices (now columns exist)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_users_name ON users(full_name)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_users_allowneg ON users(allow_negative_user)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_kwh_ops_user ON kwh_operations(user_id)")
@@ -137,13 +160,13 @@ async def get_user_negative_policy(user_id: int):
         row = await cur.fetchone()
     if not row:
         return False, "GLOBAL", None, _env_allow_negative_default()
-
     user_val = row[0]  # None|0|1
     g = _env_allow_negative_default()
     if user_val is None:
         return g, "GLOBAL", None, g
     return bool(user_val), "USER", bool(user_val), g
 
+# enabled: True=ON, False=OFF, None=DEFAULT (clear override)
 async def set_user_allow_negative(user_id: int, enabled: bool|None) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         if enabled is None:
@@ -346,7 +369,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _is_admin(user.id):
         await update.message.reply_text("Pannello admin:", reply_markup=admin_home_kb())
     else:
-        # show user short help
         await update.message.reply_text("Ciao! Comandi disponibili: /saldo, /storico")
 
 async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -525,6 +547,13 @@ async def cmd_allow_negative(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ---------- AC (credit) flow ----------
 
+class ACState(IntEnum):
+    SELECT_USER = 1
+    ASK_AMOUNT  = 2
+    ASK_SLOT    = 3
+    CONFIRM     = 4
+    FIND_USER   = 5
+
 async def on_ac_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -582,12 +611,8 @@ async def on_ac_pick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = int(q.data.split(":",1)[1])
     context.user_data.setdefault('ac', {})['user_id'] = uid
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📜 Storico ultime 10", callback_data=f"ACH:{uid}")]
-    ])
-    await q.edit_message_text(
-        "Inserisci la quantità di kWh da accreditare (es. 10 o 12,5):\n\nPuoi anche vedere lo storico.",
-    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📜 Storico ultime 10", callback_data=f"ACH:{uid}")]])
+    await q.edit_message_text("Inserisci la quantità di kWh da accreditare (es. 10 o 12,5):\n\nPuoi anche vedere lo storico.")
     await q.edit_message_reply_markup(reply_markup=kb)
     return ACState.ASK_AMOUNT
 
@@ -697,6 +722,13 @@ async def on_ac_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- AD (debit) flow ----------
 
+class ADState(IntEnum):
+    SELECT_USER = 11
+    ASK_AMOUNT  = 12
+    ASK_SLOT    = 13
+    CONFIRM     = 14
+    FIND_USER   = 15
+
 async def on_ad_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -749,7 +781,6 @@ async def on_ad_pick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     if not _is_admin(q.from_user.id):
         return ConversationHandler.END
-    # accetta sia ACU: sia ADU:
     if not (q.data.startswith("ACU:") or q.data.startswith("ADU:")):
         return ConversationHandler.END
     uid = int(q.data.split(":",1)[1])
@@ -877,21 +908,30 @@ async def on_allowneg_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Misc ----------
 
 async def on_admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Utility to reopen admin menu
     if update.message:
         await update.message.reply_text("Pannello admin:", reply_markup=admin_home_kb())
 
-# no-op callback (for info label)
 async def on_nop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
+# ---------- Global error handler ----------
+
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = context.error
+    print("GLOBAL ERROR:", err)
+    # Optional: notify admins
+    # for admin_id in ADMIN_IDS:
+    #     try:
+    #         await context.bot.send_message(admin_id, f"⚠️ Errore: {err}")
+    #     except TelegramError:
+    #         pass
 
 # ---------- Conversation registrations ----------
 
 def build_application(token: str | None = None) -> Application:
     app = Application.builder().token(token or os.getenv("TELEGRAM_TOKEN")).build()
 
-    # Ensure DB on startup
     async def _post_init(app_: Application):
         await init_db()
     app.post_init = _post_init
@@ -950,5 +990,8 @@ def build_application(token: str | None = None) -> Application:
     app.add_handler(CallbackQueryHandler(on_allowneg_set, pattern="^ALN_SET:\\d+:(on|off|default)$"), group=0)
     app.add_handler(CallbackQueryHandler(on_ac_history, pattern="^ACH:\\d+$"), group=0)
     app.add_handler(CallbackQueryHandler(on_nop, pattern="^NOP$"), group=0)
+
+    # Global error handler
+    app.add_error_handler(handle_error)
 
     return app
