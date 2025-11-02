@@ -1,67 +1,79 @@
-import os, pathlib, logging
-log = logging.getLogger(__name__)
-
-DB_DIR = "/var/data"
-pathlib.Path(DB_DIR).mkdir(parents=True, exist_ok=True)
-
-# Forza i tmp di processo e SQLite nel volume (evita /tmp o dir read-only)
-os.environ.setdefault("TMPDIR", DB_DIR)
-os.environ.setdefault("TEMP", DB_DIR)
-os.environ.setdefault("TMP", DB_DIR)
-os.environ.setdefault("SQLITE_TMPDIR", DB_DIR)
-
-DB_PATH = os.getenv("DB_PATH", "/var/data/kwh_slots.db")
-log.info("DB_PATH=%s | TMPDIR=%s", DB_PATH, os.getenv("TMPDIR"))
-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-import os, logging
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+# serve_bot_webhook.py — versione pronta per PTB 21.6 + FastAPI + Railway
+import os
+import logging
+from fastapi import FastAPI, Request, HTTPException, Response
+from fastapi.responses import PlainTextResponse
 from telegram import Update
-from telegram.ext import Application
-from bot_slots_flow import build_application
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-os.environ.setdefault("PUBLIC_URL", "https://saldo-bot-production.up.railway.app")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("serve_bot_webhook")
 
-app = FastAPI()
-tg_app: Application | None = None
-WEBHOOK_PATH = "/telegram"
+APP_URL = os.environ.get("APP_URL", "https://saldo-bot-production.up.railway.app")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/telegram")
+WEBHOOK_SECRET = os.environ.get("TG_WEBHOOK_SECRET", "PLEASE_CHANGE_ME")
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Missing TELEGRAM_TOKEN env var")
+
+app = FastAPI(title="saldo-bot webhook")
+
+# PTB Application istanza globale
+ptb_app: Application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+
+# --- Handlers minimi (fallback) ---
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Gestisce sia /start che messaggi diretti per smoke-test
+    if update.message:
+        await update.message.reply_text("Ciao! ✅ Bot attivo. Inviami un comando o un messaggio.")
+    elif update.callback_query:
+        await update.callback_query.answer("Bot attivo")
+
+
+# Registra almeno /start (se poi ne aggiungi altri altrove, restano)
+ptb_app.add_handler(CommandHandler("start", cmd_start))
+
 
 @app.on_event("startup")
 async def on_startup():
-    global tg_app
-    logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(name)s: %(message)s')
-    if not PUBLIC_URL or not PUBLIC_URL.startswith("https://"):
-        logging.error("PUBLIC_URL non configurato o non HTTPS. Imposta PUBLIC_URL per usare il webhook.")
-        return
-    tg_app = build_application()
-    await tg_app.initialize()
-    await tg_app.start()
-    await tg_app.bot.set_webhook(url=PUBLIC_URL + WEBHOOK_PATH, secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
-    logging.info("Webhook set to %s%s", PUBLIC_URL, WEBHOOK_PATH)
+    # Avvia PTB e imposta webhook
+    await ptb_app.initialize()
+    await ptb_app.start()
+    url = f"{APP_URL.rstrip('/')}{WEBHOOK_PATH}"
+    await ptb_app.bot.set_webhook(
+        url=url,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
+        allowed_updates=["message", "callback_query", "chat_member"]
+    )
+    log.info("Webhook set to %s", url)
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    global tg_app
-    if tg_app:
-        await tg_app.bot.delete_webhook()
-        await tg_app.stop()
-        await tg_app.shutdown()
+    try:
+        await ptb_app.stop()
+        await ptb_app.shutdown()
+    except Exception:
+        log.exception("Error on PTB shutdown")
+
 
 @app.get("/")
-async def health():
-    return {"status":"ok","mode":"webhook","public_url": PUBLIC_URL}
+async def root():
+    return PlainTextResponse("OK")
+
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
-    if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret token")
-    if not tg_app:
-        raise HTTPException(status_code=503, detail="Bot not initialized")
+    # Verifica secret header (se non matcha -> 403)
+    h = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if h != WEBHOOK_SECRET:
+        raise HTTPException(403, "Forbidden")
+
     data = await request.json()
-    update = Update.de_json(data, tg_app.bot)
-    await tg_app.process_update(update)
-    return JSONResponse({"ok": True})
+    update = Update.de_json(data, ptb_app.bot)
+    # processa l'update
+    await ptb_app.process_update(update)
+    return Response(status_code=200)
