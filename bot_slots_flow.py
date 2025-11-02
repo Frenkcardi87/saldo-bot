@@ -8,24 +8,24 @@
 # - SQLite (aiosqlite) with users, kwh_operations, per-user allow_negative override (with global fallback)
 # - /saldo (user & admin), /storico (user), /export_ops (admin CSV), /addebita (admin)
 # - /allow_negative <user_id> on|off|default + inline buttons to toggle
-# - Safe DB migrations for existing DBs (PRAGMA table_info)
+# - Safe DB migrations for existing DBs (PRAGMA table_info) + UNIQUE index on tg_id
 # - Global error handler for PTB
-#
-# Build entrypoint: build_application()  -> returns PTB Application ready with handlers
+# - IMPROVED: structured logging and clearer /start messages
 #
 # Env:
 #   TELEGRAM_TOKEN
 #   ADMIN_IDS          (e.g. "111,222")
-#   DB_PATH            (default: kwh_slots.db; es. Railway volume: /data/kwh_slots.db)
+#   DB_PATH            (default: kwh_slots.db; e.g. Railway volume: /data/kwh_slots.db)
 #   MAX_WALLET_KWH     (default: 100000)
 #   MAX_CREDIT_PER_OP  (default: 50000)
 #   ALLOW_NEGATIVE     (default: "0" / False)
 #
-# Requires: python-telegram-bot==21.6, aiosqlite, fastapi/uvicorn (per server esterno)
+# Requires: python-telegram-bot==21.6, aiosqlite
 
 import os
 import io
 import csv
+import logging
 import aiosqlite
 from enum import IntEnum
 from datetime import datetime, timedelta, timezone
@@ -45,6 +45,21 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import TelegramError
+
+__VERSION__ = "1.3.0"
+
+# ---------- Logging ----------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("bot_slots_flow")
+
+def _log_event(evt: str, **kwargs):
+    # tiny helper for structured-ish logging
+    extra = " ".join(f"{k}={v}" for k, v in kwargs.items())
+    log.info("%s %s", evt, extra)
 
 # ---------- Config & Defaults ----------
 
@@ -86,6 +101,7 @@ async def _get_table_columns(db, table: str) -> set[str]:
     return cols
 
 async def init_db():
+    _log_event("DB_INIT_START", db_path=DB_PATH)
     async with aiosqlite.connect(DB_PATH) as db:
         # 1) Ensure tables exist (minimal schemas)
         await db.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY)")
@@ -105,13 +121,17 @@ async def init_db():
         # 2) Users columns migration (add missing columns safely)
         cols = await _get_table_columns(db, "users")
         if "tg_id" not in cols:
-            await db.execute("ALTER TABLE users ADD COLUMN tg_id INTEGER UNIQUE")
+            await db.execute("ALTER TABLE users ADD COLUMN tg_id INTEGER")
+            _log_event("DB_MIGRATE_ADD_COL", table="users", column="tg_id")
         if "full_name" not in cols:
             await db.execute("ALTER TABLE users ADD COLUMN full_name TEXT")
+            _log_event("DB_MIGRATE_ADD_COL", table="users", column="full_name")
         if "wallet_kwh" not in cols:
             await db.execute("ALTER TABLE users ADD COLUMN wallet_kwh REAL NOT NULL DEFAULT 0")
+            _log_event("DB_MIGRATE_ADD_COL", table="users", column="wallet_kwh")
         if "allow_negative_user" not in cols:
             await db.execute("ALTER TABLE users ADD COLUMN allow_negative_user INTEGER")
+            _log_event("DB_MIGRATE_ADD_COL", table="users", column="allow_negative_user")
         await db.commit()
 
         # 3) Backfill defaults
@@ -119,11 +139,17 @@ async def init_db():
         await db.commit()
 
         # 4) Indices (now columns exist)
+        try:
+            await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tgid ON users(tg_id)")
+        except Exception as e:
+            log.warning("UNIQUE index on tg_id not created (possible duplicates): %s", e)
+
         await db.execute("CREATE INDEX IF NOT EXISTS idx_users_name ON users(full_name)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_users_allowneg ON users(allow_negative_user)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_kwh_ops_user ON kwh_operations(user_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_kwh_ops_created ON kwh_operations(created_at)")
         await db.commit()
+    _log_event("DB_INIT_DONE")
 
 # ---------- Helpers ----------
 
@@ -174,6 +200,7 @@ async def set_user_allow_negative(user_id: int, enabled: bool|None) -> bool:
         else:
             cur = await db.execute("UPDATE users SET allow_negative_user=? WHERE id=?", (1 if enabled else 0, user_id))
         await db.commit()
+        _log_event("ALLOW_NEG_SET", user_id=user_id, value=("DEFAULT" if enabled is None else ("ON" if enabled else "OFF")))
         return cur.rowcount > 0
 
 # Money engine
@@ -200,10 +227,12 @@ async def apply_delta_kwh(user_id: int, delta: float, reason: str, slot: str|Non
 
             if not allow_neg and new_balance < 0:
                 await db.execute("ROLLBACK")
+                _log_event("DELTA_BLOCKED_NEGATIVE", user_id=user_id, delta=delta, old=old_balance, new=new_balance)
                 return False, old_balance, old_balance
 
             if new_balance > MAX_WALLET_KWH:
                 await db.execute("ROLLBACK")
+                _log_event("DELTA_BLOCKED_MAX", user_id=user_id, delta=delta, old=old_balance, new=new_balance)
                 return False, None, None
 
             await db.execute("UPDATE users SET wallet_kwh=? WHERE id=?", (new_balance, user_id))
@@ -212,12 +241,13 @@ async def apply_delta_kwh(user_id: int, delta: float, reason: str, slot: str|Non
                 VALUES (?,?,?,?,?)
             """, (user_id, float(delta), reason, slot, admin_id))
             await db.commit()
+            _log_event("DELTA_APPLIED", user_id=user_id, delta=delta, reason=reason, slot=slot, admin=admin_id, old=old_balance, new=new_balance)
             return True, old_balance, new_balance
 
         except Exception as e:
             try: await db.execute("ROLLBACK")
             except: pass
-            print("ERR apply_delta_kwh:", e)
+            log.exception("ERR apply_delta_kwh: %s", e)
             return False, None, None
 
 async def accredita_kwh(user_id: int, amount: float, slot: str|None, admin_id: int|None):
@@ -366,13 +396,33 @@ class ADState(IntEnum):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await init_db()
     user = update.effective_user
+    _log_event("CMD_START", tg_id=user.id, name=user.full_name)
     if _is_admin(user.id):
-        await update.message.reply_text("Pannello admin:", reply_markup=admin_home_kb())
+        msg = (
+            f"👋 *Admin* — saldo-bot v{__VERSION__}\n\n"
+            "Usa i bottoni qui sotto per operare:\n"
+            "• ➕ *Ricarica*: accredita kWh a un utente\n"
+            "• ➖ *Addebita*: addebita kWh a un utente\n\n"
+            "_Comandi utili:_\n"
+            "• `/allow_negative <user_id> on|off|default`\n"
+            "• `/saldo [user_id]` — vedi saldo (anche per utente specifico)\n"
+            "• `/export_ops user:<id> [dal] [al]` — esporta CSV\n"
+            f"_DB:_ `{DB_PATH}`"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=admin_home_kb())
     else:
-        await update.message.reply_text("Ciao! Comandi disponibili: /saldo, /storico")
+        msg = (
+            f"👋 Ciao! Questo è *saldo-bot* v{__VERSION__}.\n\n"
+            "Comandi disponibili:\n"
+            "• `/saldo` — vedi il tuo saldo e le ultime operazioni\n"
+            "• `/storico` — elenco ultime 10 operazioni\n\n"
+            "Se ti serve assistenza contatta un amministratore."
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caller = update.effective_user.id
+    _log_event("CMD_SALDO", caller=caller, args=" ".join(context.args or []))
     args = context.args
     target_user_id = None
 
@@ -412,6 +462,7 @@ async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_storico(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    _log_event("CMD_STORICO", caller=uid)
     row = await get_user_by_tgid(uid)
     if not row:
         await update.message.reply_text("Non sei registrato.")
@@ -430,6 +481,7 @@ async def cmd_storico(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_export_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caller = update.effective_user.id
+    _log_event("CMD_EXPORT_OPS", caller=caller, args=" ".join(context.args or []))
     if not _is_admin(caller):
         await update.message.reply_text("Comando riservato agli admin.")
         return
@@ -483,6 +535,7 @@ async def cmd_export_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_addebita(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caller = update.effective_user.id
+    _log_event("CMD_ADDEBITA", caller=caller, args=" ".join(context.args or []))
     if not _is_admin(caller):
         await update.message.reply_text("Comando riservato agli admin.")
         return
@@ -515,6 +568,7 @@ async def cmd_addebita(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_allow_negative(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caller = update.effective_user.id
+    _log_event("CMD_ALLOW_NEG", caller=caller, args=" ".join(context.args or []))
     if not _is_admin(caller):
         await update.message.reply_text("Comando riservato agli admin.")
         return
@@ -547,13 +601,6 @@ async def cmd_allow_negative(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ---------- AC (credit) flow ----------
 
-class ACState(IntEnum):
-    SELECT_USER = 1
-    ASK_AMOUNT  = 2
-    ASK_SLOT    = 3
-    CONFIRM     = 4
-    FIND_USER   = 5
-
 async def on_ac_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -562,6 +609,7 @@ async def on_ac_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     context.user_data['ac'] = {}
     rows, total = await fetch_users_page(0)
+    _log_event("AC_START", admin=q.from_user.id, page=0, total=total)
     await q.edit_message_text(
         "Seleziona l’utente da accreditare:",
         reply_markup=build_users_kb(rows, 0, total)
@@ -575,6 +623,7 @@ async def on_ac_users_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     page = int(q.data.split(":",1)[1])
     rows, total = await fetch_users_page(page)
+    _log_event("AC_PAGE", admin=q.from_user.id, page=page, total=total)
     await q.edit_message_reply_markup(reply_markup=build_users_kb(rows, page, total))
     return ACState.SELECT_USER
 
@@ -592,6 +641,7 @@ async def on_ac_find_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Inserisci almeno 2 caratteri.")
         return ACState.FIND_USER
     rows = await search_users_by_name(qtxt)
+    _log_event("AC_FIND", query=qtxt, results=len(rows))
     if not rows:
         await update.message.reply_text("Nessun risultato. Riprova.")
         return ACState.FIND_USER
@@ -610,6 +660,7 @@ async def on_ac_pick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     uid = int(q.data.split(":",1)[1])
     context.user_data.setdefault('ac', {})['user_id'] = uid
+    _log_event("AC_PICK_USER", admin=q.from_user.id, user_id=uid)
 
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📜 Storico ultime 10", callback_data=f"ACH:{uid}")]])
     await q.edit_message_text("Inserisci la quantità di kWh da accreditare (es. 10 o 12,5):\n\nPuoi anche vedere lo storico.")
@@ -631,6 +682,7 @@ async def on_ac_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ACState.ASK_AMOUNT
 
     context.user_data['ac']['amount'] = amount
+    _log_event("AC_AMOUNT_SET", amount=amount)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Slot 8", callback_data="ACS:8"),
          InlineKeyboardButton("Slot 3", callback_data="ACS:3"),
@@ -652,6 +704,7 @@ async def on_ac_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _s = q.data.split(":",1)[1]
         slot = None if _s == "-" else _s
     context.user_data['ac']['slot'] = slot
+    _log_event("AC_SLOT_SET", slot=slot)
 
     data = context.user_data['ac']
     uid = data['user_id']; amount = data['amount']; slot = data.get('slot')
@@ -678,6 +731,7 @@ async def on_ac_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ok, old_bal, new_bal = await accredita_kwh(uid, amount, slot, admin_id)
     if not ok:
+        _log_event("AC_CREDIT_FAIL", user_id=uid, amount=amount)
         await q.edit_message_text("❗ Errore durante l’accredito (limiti/policy).")
         return ConversationHandler.END
 
@@ -698,6 +752,7 @@ async def on_ac_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception:
         pass
+    _log_event("AC_CREDIT_OK", user_id=uid, amount=amount, old=old_bal, new=new_bal)
 
     return ConversationHandler.END
 
@@ -709,6 +764,7 @@ async def on_ac_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     uid = int(q.data.split(":",1)[1])
     rows = await fetch_user_ops(uid, 10)
+    _log_event("AC_HISTORY", user_id=uid, count=len(rows or []))
     if not rows:
         await q.edit_message_text("Nessuna operazione registrata per questo utente.")
         return ACState.SELECT_USER
@@ -722,13 +778,6 @@ async def on_ac_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- AD (debit) flow ----------
 
-class ADState(IntEnum):
-    SELECT_USER = 11
-    ASK_AMOUNT  = 12
-    ASK_SLOT    = 13
-    CONFIRM     = 14
-    FIND_USER   = 15
-
 async def on_ad_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -737,6 +786,7 @@ async def on_ad_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     context.user_data['ad'] = {}
     rows, total = await fetch_users_page(0)
+    _log_event("AD_START", admin=q.from_user.id, page=0, total=total)
     await q.edit_message_text(
         "Seleziona l’utente da addebitare:",
         reply_markup=build_users_kb(rows, 0, total)
@@ -750,6 +800,7 @@ async def on_ad_users_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     page = int(q.data.split(":",1)[1])
     rows, total = await fetch_users_page(page)
+    _log_event("AD_PAGE", admin=q.from_user.id, page=page, total=total)
     await q.edit_message_reply_markup(reply_markup=build_users_kb(rows, page, total))
     return ADState.SELECT_USER
 
@@ -767,6 +818,7 @@ async def on_ad_find_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Inserisci almeno 2 caratteri.")
         return ADState.FIND_USER
     rows = await search_users_by_name(qtxt)
+    _log_event("AD_FIND", query=qtxt, results=len(rows))
     if not rows:
         await update.message.reply_text("Nessun risultato. Riprova.")
         return ADState.FIND_USER
@@ -785,6 +837,7 @@ async def on_ad_pick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     uid = int(q.data.split(":",1)[1])
     context.user_data.setdefault('ad', {})['user_id'] = uid
+    _log_event("AD_PICK_USER", admin=q.from_user.id, user_id=uid)
 
     await q.edit_message_text("Inserisci la quantità di kWh da addebitare (es. 5 o 7,5).")
     return ADState.ASK_AMOUNT
@@ -803,6 +856,7 @@ async def on_ad_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ADState.ASK_AMOUNT
 
     context.user_data['ad']['amount'] = amount
+    _log_event("AD_AMOUNT_SET", amount=amount)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Slot 8", callback_data="ADS:8"),
          InlineKeyboardButton("Slot 3", callback_data="ADS:3"),
@@ -824,6 +878,7 @@ async def on_ad_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _s = q.data.split(":",1)[1]
         slot = None if _s == "-" else _s
     context.user_data['ad']['slot'] = slot
+    _log_event("AD_SLOT_SET", slot=slot)
 
     data = context.user_data['ad']
     uid = data['user_id']; amount = data['amount']; slot = data.get('slot')
@@ -850,6 +905,7 @@ async def on_ad_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ok, old_bal, new_bal = await addebita_kwh(uid, amount, slot, admin_id)
     if not ok:
+        _log_event("AD_DEBIT_FAIL", user_id=uid, amount=amount)
         if old_bal is not None and new_bal is not None and old_bal == new_bal and (old_bal - amount) < 0:
             await q.edit_message_text("❗ Saldo insufficiente e negativo non consentito per questo utente.")
         else:
@@ -874,6 +930,7 @@ async def on_ad_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception:
         pass
+    _log_event("AD_DEBIT_OK", user_id=uid, amount=amount, old=old_bal, new=new_bal)
 
     return ConversationHandler.END
 
@@ -909,6 +966,7 @@ async def on_allowneg_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
+        _log_event("CMD_ADMIN_MENU", caller=update.effective_user.id)
         await update.message.reply_text("Pannello admin:", reply_markup=admin_home_kb())
 
 async def on_nop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -919,8 +977,9 @@ async def on_nop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     err = context.error
-    print("GLOBAL ERROR:", err)
-    # Optional: notify admins
+    # PTB already logs, but we add our own with structured info
+    log.exception("GLOBAL_ERROR: %s", err)
+    # Optional: notify admins (disabled by default)
     # for admin_id in ADMIN_IDS:
     #     try:
     #         await context.bot.send_message(admin_id, f"⚠️ Errore: {err}")
@@ -934,6 +993,7 @@ def build_application(token: str | None = None) -> Application:
 
     async def _post_init(app_: Application):
         await init_db()
+        _log_event("APP_READY", version=__VERSION__)
     app.post_init = _post_init
 
     # Commands
