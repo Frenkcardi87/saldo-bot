@@ -140,3 +140,33 @@ def _init_db_instance() -> DB:
 
 
 DBI = _init_db_instance()
+
+# --- Compat shim per vecchio import da serve_bot_webhook.py ---
+def build_application():
+    """
+    Ritorna l'Application di python-telegram-bot se possibile.
+    In fallback ritorna una piccola FastAPI (healthcheck) così l'import non fallisce.
+    """
+    try:
+        from telegram.ext import Application
+        import os
+        token = os.environ.get("TELEGRAM_TOKEN")
+        if not token:
+            raise RuntimeError("Missing TELEGRAM_TOKEN")
+        return Application.builder().token(token).build()
+    except Exception as e:
+        # Fallback: FastAPI minimale per non far fallire uvicorn / import
+        try:
+            from fastapi import FastAPI
+            from fastapi.responses import PlainTextResponse
+            app = FastAPI()
+
+            @app.get("/")
+            async def health():
+                return PlainTextResponse(f"OK (fallback build_application): {e}")
+
+            return app
+        except Exception:
+            # Ultimissimo fallback: oggetto innocuo
+            class _Dummy: ...
+            return _Dummy()
