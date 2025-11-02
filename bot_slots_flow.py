@@ -60,6 +60,34 @@ DATE_FMT = "%Y-%m-%d %H:%M:%S"
 # =============================
 # DB LAYER
 # =============================
+import logging
+
+def _init_db_instance() -> 'DB':
+    """Try DB at DB_PATH; on failure (e.g., read-only FS on Railway), fall back to /tmp/kwh_slots.db"""
+    global DB_PATH
+    try:
+        db = DB(DB_PATH)
+        # smoke test: open connection and pragma
+        with db.conn() as con:
+            con.execute("PRAGMA journal_mode=WAL")
+        logging.info("DB initialized at %s", DB_PATH)
+        return db
+    except Exception as e:
+        logging.warning("DB init failed at %s: %s", DB_PATH, e)
+        # fallback
+        fallback = "/tmp/kwh_slots.db"
+        try:
+            DB_PATH = fallback
+            db = DB(DB_PATH)
+            with db.conn() as con:
+                con.execute("PRAGMA journal_mode=WAL")
+            logging.info("DB fallback initialized at %s", DB_PATH)
+            return db
+        except Exception as e2:
+            logging.exception("DB fallback failed at /tmp: %s", e2)
+            raise
+
+
 class DB:
     def __init__(self, path: str):
         self.path = path
@@ -322,7 +350,7 @@ class DB:
 # =============================
 # UTILS & CONSTANTS
 # =============================
-DBI = DB(DB_PATH)
+DBI = _init_db_instance()
 
 MENU_USER = InlineKeyboardMarkup([
     [InlineKeyboardButton("📊 Saldo", callback_data="menu:saldo")],
@@ -366,7 +394,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         DBI.ensure_user(user)
     except Exception as e:
         logging.exception("ensure_user failed: %s", e)
-        await update.message.reply_text("⚠️ Errore DB in registrazione. Provo comunque a mostrarti il menu.")
+        await update.message.reply_text("⚠️ Errore DB in registrazione (probabile file non scrivibile). Provo comunque a mostrarti il menu.")
     buttons = [*MENU_USER.inline_keyboard]
     if is_admin(user.id):
         buttons += MENU_ADMIN_EXTRAS
