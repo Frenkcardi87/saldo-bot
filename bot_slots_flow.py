@@ -24,6 +24,8 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
+import logging
+
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -354,6 +356,9 @@ async def smart_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
 # =============================
 # COMMANDS
 # =============================
+async def cmd_ping(update, context):
+    await update.message.reply_text("pong")
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     DBI.ensure_user(user)
@@ -814,6 +819,10 @@ async def _notify_admins_started(app: Application):
             pass
 
 
+async def on_error(update, context):
+    logging.exception("Exception while handling an update: %s", context.error)
+
+
 def build_application() -> Application:
     if not TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN mancante")
@@ -825,6 +834,7 @@ def build_application() -> Application:
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("saldo", cmd_saldo))
     app.add_handler(CommandHandler("pending", cmd_pending))
@@ -843,14 +853,15 @@ def build_application() -> Application:
     app.add_handler(MessageHandler(filters.PHOTO, on_message_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_wallet_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message_text))
-    app.add_handler(MessageHandler(filters.PHOTO, lambda u, c: u.effective_chat.send_message("Foto ricevuta. Se stai dichiarando una ricarica, invia prima i kWh.")))
-
     return app
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(name)s: %(message)s')
     app = build_application()
-    app.run_polling(close_loop=False)
+    app.add_error_handler(on_error)
+    from telegram import Update
+    app.run_polling(close_loop=False, allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
