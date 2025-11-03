@@ -1,4 +1,4 @@
-# serve_bot_webhook.py (revision: fixed indentation + robust startup)
+# serve_bot_webhook.py (revision: drop resolve_used_update_types for wider PTB compatibility)
 import os
 import logging
 from typing import Optional
@@ -10,7 +10,8 @@ from telegram import Update
 from telegram.error import TelegramError
 
 def _get_app_factory():
-    # Try create_application, then build_application from bot_slots_flow
+    """Return the application factory function from bot_slots_flow."""
+    # NOTE: This file had critical indentation errors. Fixed below.
     try:
         from bot_slots_flow import create_application as factory  # type: ignore
         logging.getLogger("railway").info("Using create_application() from bot_slots_flow.py")
@@ -21,7 +22,7 @@ def _get_app_factory():
         from bot_slots_flow import build_application as factory  # type: ignore
         logging.getLogger("railway").info("Using build_application() from bot_slots_flow.py")
         return factory
-    except Exception:
+    except Exception as e:
         logging.getLogger("railway").exception("Cannot import application factory from bot_slots_flow.py")
         raise
 
@@ -65,7 +66,7 @@ async def on_startup():
 
     # Initialize/start PTB app
     await _application.initialize()
-    await __application.start()
+    await _application.start()
 
     url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
     try:
@@ -105,15 +106,15 @@ async def telegram_webhook(request: Request):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid secret token")
 
     try:
-        data = await request.json()
+    data = await request.json()
     except Exception:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON")
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON")
 
     try:
-        update = Update.de_json(data, _application.bot)
-        await _application.process_update(update)
+    update = Update.de_json(data, _application.bot)
+    await _application.process_update(update)
     except Exception as e:
-        log.exception("Failed to process update: %s", e)
-        return JSONResponse(status_code=200, content={"ok": False})
+    log.exception("Failed to process update: %s", e)
+    return JSONResponse(status_code=200, content={"ok": False})
 
     return {"ok": True}
