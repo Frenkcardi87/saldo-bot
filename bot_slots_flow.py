@@ -8,9 +8,10 @@
 # - SQLite (aiosqlite) with users, kwh_operations, per-user allow_negative override (with global fallback)
 # - /saldo (user & admin), /storico (user), /export_ops (admin CSV), /addebita (admin)
 # - /allow_negative <user_id> on|off|default + inline buttons to toggle
-# - Safe DB migrations for existing DBs (PRAGMA table_info) + UNIQUE index on tg_id
+# - Safe DB migrations for existing DBs (PRAGMA table_info) + UNIQUE index on tg_id (via CREATE UNIQUE INDEX)
 # - Global error handler for PTB
-# - IMPROVED: structured logging and clearer /start messages
+# - Structured logging + clearer /start message with legacy commands list
+# - Hardened /start (works even if update.message is None) + /ping
 #
 # Env:
 #   TELEGRAM_TOKEN
@@ -46,7 +47,7 @@ from telegram.ext import (
 )
 from telegram.error import TelegramError
 
-__VERSION__ = "1.3.0"
+__VERSION__ = "1.3.2"
 
 # ---------- Logging ----------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -57,7 +58,6 @@ logging.basicConfig(
 log = logging.getLogger("bot_slots_flow")
 
 def _log_event(evt: str, **kwargs):
-    # tiny helper for structured-ish logging
     extra = " ".join(f"{k}={v}" for k, v in kwargs.items())
     log.info("%s %s", evt, extra)
 
@@ -96,8 +96,7 @@ async def _get_table_columns(db, table: str) -> set[str]:
     cols = set()
     async with db.execute(f"PRAGMA table_info({table})") as cur:
         async for row in cur:
-            # PRAGMA table_info: cid, name, type, notnull, dflt_value, pk
-            cols.add(row[1])
+            cols.add(row[1])  # name
     return cols
 
 async def init_db():
@@ -162,6 +161,29 @@ def _is_number(text: str) -> bool:
         return True
     except Exception:
         return False
+
+async def ensure_user(tg_id: int, full_name: str | None):
+    """Create (id=tg_id) if missing; update name if changed."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id, full_name FROM users WHERE tg_id=?", (tg_id,))
+        row = await cur.fetchone()
+        if row:
+            uid, old_name = row
+            if full_name and full_name != old_name:
+                await db.execute("UPDATE users SET full_name=? WHERE id=?", (full_name, uid))
+                await db.commit()
+            return uid
+        # not found: create new with id=tg_id so that internal id == chat id
+        await db.execute("INSERT INTO users (id, tg_id, full_name, wallet_kwh) VALUES (?,?,?,0)", (tg_id, tg_id, full_name or ""))
+        await db.commit()
+        _log_event("USER_CREATED", tg_id=tg_id, name=full_name or "")
+        return tg_id
+
+async def get_tgid_by_userid(user_id: int) -> int | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT tg_id FROM users WHERE id=?", (user_id,))
+        row = await cur.fetchone()
+        return row[0] if row and row[0] is not None else None
 
 async def get_user_by_tgid(tg_id:int):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -394,34 +416,77 @@ class ADState(IntEnum):
 # ---------- Commands ----------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await init_db()
+    """Safe /start: works even if update.message is None (e.g., via button/forward)."""
+    try:
+        await init_db()
+    except Exception as e:
+        log.exception("INIT_DB_FAILED: %s", e)
+
     user = update.effective_user
-    _log_event("CMD_START", tg_id=user.id, name=user.full_name)
-    if _is_admin(user.id):
+    chat = update.effective_chat
+    try:
+        if user:
+            await ensure_user(user.id, getattr(user, "full_name", None))
+    except Exception as e:
+        log.exception("ENSURE_USER_FAILED: %s", e)
+
+    _log_event("CMD_START", tg_id=(user.id if user else None), name=(getattr(user, "full_name", None)))
+
+    # Build message text
+    if user and (user.id in ADMIN_IDS):
         msg = (
             f"👋 *Admin* — saldo-bot v{__VERSION__}\n\n"
-            "Usa i bottoni qui sotto per operare:\n"
+            "Pannello rapido:\n"
             "• ➕ *Ricarica*: accredita kWh a un utente\n"
             "• ➖ *Addebita*: addebita kWh a un utente\n\n"
-            "_Comandi utili:_\n"
+            "ℹ️ *Comandi disponibili*\n"
+            "• /saldo — mostra i tuoi kWh\n"
+            "• /ricarica <slot1|slot3|slot5|slot8|wallet> <kwh> — invia richiesta\n"
+            "• Invia foto con didascalia: `slot3 4.5` per allegare prova\n\n"
+            "👮 *Admin:*\n"
+            "• /pending — elenca richieste in attesa\n"
+            "• /approve <id> — approva richiesta\n"
+            "• /reject <id> — rifiuta richiesta\n"
+            "• /users — ultimi utenti con saldi\n"
+            "• /credita <chat_id> <slot> <kwh> — accredito manuale\n\n"
+            "_Comandi extra:_\n"
             "• `/allow_negative <user_id> on|off|default`\n"
-            "• `/saldo [user_id]` — vedi saldo (anche per utente specifico)\n"
-            "• `/export_ops user:<id> [dal] [al]` — esporta CSV\n"
+            "• `/export_ops user:<id> [dal] [al]`\n"
             f"_DB:_ `{DB_PATH}`"
         )
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=admin_home_kb())
+        kb = admin_home_kb()
     else:
         msg = (
             f"👋 Ciao! Questo è *saldo-bot* v{__VERSION__}.\n\n"
-            "Comandi disponibili:\n"
-            "• `/saldo` — vedi il tuo saldo e le ultime operazioni\n"
-            "• `/storico` — elenco ultime 10 operazioni\n\n"
+            "ℹ️ *Comandi disponibili*\n"
+            "• /saldo — mostra i tuoi kWh\n"
+            "• /ricarica <slot1|slot3|slot5|slot8|wallet> <kwh> — invia richiesta\n"
+            "• Invia foto con didascalia: `slot3 4.5` per allegare prova\n\n"
             "Se ti serve assistenza contatta un amministratore."
         )
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        kb = None
+
+    # Reply safely (works even without update.message)
+    try:
+        if chat:
+            await context.bot.send_message(chat_id=chat.id, text=msg, parse_mode="Markdown", reply_markup=kb)
+        elif update.message:
+            await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+    except Exception as e:
+        log.exception("START_REPLY_FAILED: %s", e)
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Quick health check command."""
+    try:
+        await update.effective_message.reply_text("pong")
+    except Exception:
+        chat = update.effective_chat
+        if chat:
+            await context.bot.send_message(chat_id=chat.id, text="pong")
 
 async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caller = update.effective_user.id
+    await ensure_user(caller, update.effective_user.full_name)
     _log_event("CMD_SALDO", caller=caller, args=" ".join(context.args or []))
     args = context.args
     target_user_id = None
@@ -462,6 +527,7 @@ async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_storico(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    await ensure_user(uid, update.effective_user.full_name)
     _log_event("CMD_STORICO", caller=uid)
     row = await get_user_by_tgid(uid)
     if not row:
@@ -491,7 +557,6 @@ async def cmd_export_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d_from = None
     d_to   = None
 
-    # parse user:NNN
     for tok in list(args):
         if tok.lower().startswith("user:"):
             try:
@@ -746,10 +811,12 @@ async def on_ac_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(summary, parse_mode="Markdown")
 
     try:
-        await context.bot.send_message(
-            chat_id=uid,
-            text=f"✅ Ti sono stati accreditati {amount:g} kWh.\nSaldo: {old_bal:.2f} → {new_bal:.2f} kWh"
-        )
+        tg = await get_tgid_by_userid(uid)
+        if tg:
+            await context.bot.send_message(
+                chat_id=tg,
+                text=f"✅ Ti sono stati accreditati {amount:g} kWh.\nSaldo: {old_bal:.2f} → {new_bal:.2f} kWh"
+            )
     except Exception:
         pass
     _log_event("AC_CREDIT_OK", user_id=uid, amount=amount, old=old_bal, new=new_bal)
@@ -852,7 +919,7 @@ async def on_ad_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("L’importo deve essere maggiore di zero.")
         return ADState.ASK_AMOUNT
     if amount > MAX_CREDIT_PER_OP:
-        await update.message.reply_text(f"Massimo per singola operazione: {MAX_CREDIT_PER_OP:g} kWh.")
+        await update.message.reply_text(f"Massimo per singola operazione: {MAX_CREDIT_PER_OP:g}.")
         return ADState.ASK_AMOUNT
 
     context.user_data['ad']['amount'] = amount
@@ -923,11 +990,13 @@ async def on_ad_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(summary, parse_mode="Markdown")
 
     try:
-        await context.bot.send_message(
-            chat_id=uid,
-            text=f"⚠️ Ti sono stati *addebitati* {amount:g} kWh.\nSaldo: {old_bal:.2f} → {new_bal:.2f} kWh",
-            parse_mode="Markdown"
-        )
+        tg = await get_tgid_by_userid(uid)
+        if tg:
+            await context.bot.send_message(
+                chat_id=tg,
+                text=f"⚠️ Ti sono stati *addebitati* {amount:g} kWh.\nSaldo: {old_bal:.2f} → {new_bal:.2f} kWh",
+                parse_mode="Markdown"
+            )
     except Exception:
         pass
     _log_event("AD_DEBIT_OK", user_id=uid, amount=amount, old=old_bal, new=new_bal)
@@ -977,14 +1046,7 @@ async def on_nop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     err = context.error
-    # PTB already logs, but we add our own with structured info
     log.exception("GLOBAL_ERROR: %s", err)
-    # Optional: notify admins (disabled by default)
-    # for admin_id in ADMIN_IDS:
-    #     try:
-    #         await context.bot.send_message(admin_id, f"⚠️ Errore: {err}")
-    #     except TelegramError:
-    #         pass
 
 # ---------- Conversation registrations ----------
 
@@ -998,6 +1060,7 @@ def build_application(token: str | None = None) -> Application:
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("saldo", cmd_saldo))
     app.add_handler(CommandHandler("storico", cmd_storico))
     app.add_handler(CommandHandler("export_ops", cmd_export_ops))
