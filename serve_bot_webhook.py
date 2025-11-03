@@ -11,18 +11,18 @@ from telegram.error import TelegramError
 
 def _get_app_factory():
     try:
-        from bot_slots_flow import create_application as factory  # type: ignore
-        logging.getLogger("railway").info("Using create_application() from bot_slots_flow.py")
-        return factory
+    from bot_slots_flow import create_application as factory  # type: ignore
+    logging.getLogger("railway").info("Using create_application() from bot_slots_flow.py")
+    return factory
     except Exception:
-        pass
+    pass
     try:
-        from bot_slots_flow import build_application as factory  # type: ignore
-        logging.getLogger("railway").info("Using build_application() from bot_slots_flow.py")
-        return factory
+    from bot_slots_flow import build_application as factory  # type: ignore
+    logging.getLogger("railway").info("Using build_application() from bot_slots_flow.py")
+    return factory
     except Exception as e:
-        logging.getLogger("railway").exception("Cannot import application factory from bot_slots_flow.py")
-        raise
+    logging.getLogger("railway").exception("Cannot import application factory from bot_slots_flow.py")
+    raise
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -68,15 +68,15 @@ async def on_startup():
 
     url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
     try:
-        # Do NOT pass allowed_updates to be compatible across PTB versions
-        await _application.bot.set_webhook(
-            url=url,
-            secret_token=WEBHOOK_SECRET_TOKEN
-        )
-        log.info(f"Webhook set to {url} (secret={bool(WEBHOOK_SECRET_TOKEN)})")
+    # Do NOT pass allowed_updates to be compatible across PTB versions
+    await _application.bot.set_webhook(
+    url=url,
+    secret_token=WEBHOOK_SECRET_TOKEN
+    )
+    log.info(f"Webhook set to {url} (secret={bool(WEBHOOK_SECRET_TOKEN)})")
     except TelegramError as e:
-        log.exception("Failed to set webhook: %s", e)
-        raise
+    log.exception("Failed to set webhook: %s", e)
+    raise
 
     log.info("PTB application started. Ready to receive updates at %s", url)
 
@@ -84,19 +84,19 @@ async def on_startup():
 async def on_shutdown():
     global _application
     if _application:
-        try:
-            await _application.bot.delete_webhook()
-        except Exception:
-            pass
-        await _application.stop()
-        await _application.shutdown()
-        log.info("PTB application stopped.")
+    try:
+    await _application.bot.delete_webhook()
+    except Exception:
+    pass
+    await _application.stop()
+    await _application.shutdown()
+    log.info("PTB application stopped.")
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
     global _application
     if _application is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Application not ready")
+    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Application not ready")
 
     if WEBHOOK_SECRET_TOKEN:
         header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
@@ -109,10 +109,10 @@ async def telegram_webhook(request: Request):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON")
 
     try:
-        update = Update.de_json(data, _application.bot)
-        await _application.process_update(update)
+    update = Update.de_json(data, _application.bot)
+    await _application.process_update(update)
     except Exception as e:
-        log.exception("Failed to process update: %s", e)
-        return JSONResponse(status_code=200, content={"ok": False})
+    log.exception("Failed to process update: %s", e)
+    return JSONResponse(status_code=200, content={"ok": False})
 
     return {"ok": True}
