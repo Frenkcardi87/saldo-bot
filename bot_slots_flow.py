@@ -72,9 +72,9 @@ Path(CREDIT_PHOTOS_PATH).mkdir(parents=True, exist_ok=True)
 
 def _as_float_env(key: str, default: float) -> float:
     try:
-    return float(os.getenv(key, str(default)))
+        return float(os.getenv(key, str(default)))
     except Exception:
-    return default
+        return default
 
 MAX_WALLET_KWH    = _as_float_env("MAX_WALLET_KWH", 10000.0)
 MAX_CREDIT_PER_OP = _as_float_env("MAX_CREDIT_PER_OP", 50000.0)
@@ -1086,7 +1086,7 @@ async def on_ac_pick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_ac_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     if not _is_number(txt):
-    await update.message.reply_text("Inserisci i kWh ricaricati (es. 5 oppure 7,345).")
+    await update.message.reply_text("Valore non valido. Inserisci un numero (es. 10 oppure 12,5).")
     return ACState.ASK_AMOUNT
 
     amount = round(float(txt.replace(",", ".")), 3)
@@ -1275,7 +1275,7 @@ async def on_ad_pick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_ad_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     if not _is_number(txt):
-    await update.message.reply_text("Inserisci i kWh ricaricati (es. 5 oppure 7,345).")
+    await update.message.reply_text("Valore non valido. Inserisci un numero (es. 5 oppure 7,5).")
     return ADState.ASK_AMOUNT
     amount = round(float(txt.replace(",", ".")), 3)
     if amount <= 0:
@@ -1442,7 +1442,7 @@ async def on_cr_kwh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle kWh input"""
     txt = (update.message.text or "").strip()
     if not _is_number(txt):
-    await update.message.reply_text("Inserisci i kWh ricaricati (es. 5 oppure 7,345).")
+    await update.message.reply_text("⚠️ Valore non valido. Inserisci un numero (es. 10 oppure 12,5).")
     return CRState.ASK_KWH
     
     kwh = round(float(txt.replace(",", ".")), 3)
