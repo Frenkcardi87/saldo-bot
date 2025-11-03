@@ -316,7 +316,7 @@ async def search_users_by_name(q: str, limit: int = 20):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
             SELECT id, COALESCE(full_name,'Utente') as name, wallet_kwh
-            FROM users WHERE name LIKE ? COLLATE NOCASE
+            FROM users WHERE COALESCE(full_name,'') LIKE ? COLLATE NOCASE
             ORDER BY name LIMIT ?
         """, (like, limit))
         return await cur.fetchall()
