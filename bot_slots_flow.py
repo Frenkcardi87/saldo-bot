@@ -1118,3 +1118,209 @@ def build_application(token: str | None = None) -> Application:
     app.add_error_handler(handle_error)
 
     return app
+
+
+# ==========================
+# === PATCHED EXTENSIONS ===
+# ==========================
+# - Pending list with photo preview & navigation
+# - Admin notifications helpers
+# - Credit notification helper (to be called at end of /credita flow)
+# These additions are self-contained and only add imports locally when needed.
+
+import os
+from typing import Optional, Iterable
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ContextTypes, CommandHandler, CallbackQueryHandler
+
+PENDING_PAGE = "pending:page:"
+PENDING_PHOTO = "pending:photo:"
+
+def get_admin_ids() -> list[int]:
+    raw = os.getenv("ADMIN_IDS", "").strip()
+    ids: list[int] = []
+    for p in raw.split(","):
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            ids.append(int(p))
+        except ValueError:
+            pass
+    return ids
+
+async def notify_admins(application, text: str):
+    for admin_id in get_admin_ids():
+        try:
+            await application.bot.send_message(chat_id=admin_id, text=text, disable_web_page_preview=True)
+        except Exception:
+            # don't block for a single admin
+            pass
+
+async def _notify_credit_success(application, target_chat_id: int, delta_kwh: float, new_balance: float, reason: str = ""):
+    # call this after committing the /credita DB update
+    try:
+        txt = f"✅ Ti sono stati accreditati *{delta_kwh} kWh*.\nSaldo attuale: *{new_balance} kWh*."
+        if reason:
+            txt += f"\nMotivo: {reason}"
+        await application.bot.send_message(chat_id=target_chat_id, text=txt, parse_mode="Markdown")
+    except Exception:
+        pass
+    await notify_admins(application, f"👮 Accredito completato: +{delta_kwh} kWh a {target_chat_id} (saldo {new_balance} kWh).")
+
+# ---- PENDING: rendering & photo preview ----
+async def admin_pending_render(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    import aiosqlite
+    DB_PATH = os.getenv("DB_PATH", "kwh_slots.db")
+    PAGE_SIZE = 5
+    page = max(0, int(page))
+    offset = page * PAGE_SIZE
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT id, user_chat_id, kwh, slot, note, photo_file_id, created_at
+            FROM recharges
+            WHERE status='pending'
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+        """, (PAGE_SIZE, offset))
+        rows = await cur.fetchall()
+        cur2 = await db.execute("SELECT COUNT(*) FROM recharges WHERE status='pending'")
+        total = (await cur2.fetchone())[0]
+
+    if not rows:
+        text = "Nessuna richiesta in attesa."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text)
+        else:
+            await update.effective_chat.send_message(text)
+        return
+
+    lines = [f"📥 *Richieste in attesa* — pagina {page+1}/{max(1, (total + PAGE_SIZE - 1)//PAGE_SIZE)}"]
+    kb = []
+    for rec in rows:
+        rid, chat_id, kwh, slot, note, photo_file_id, created_at = rec
+        note = note or ""
+        lines.append(f"• #{rid} — {kwh} kWh (slot {slot}) da {chat_id}" + (f"\n   📝 {note}" if note else ""))
+        kb.append([InlineKeyboardButton("📷 Foto", callback_data=f"{PENDING_PHOTO}{rid}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Indietro", callback_data=f"{PENDING_PAGE}{page-1}"))
+    if (page+1) * PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton("Avanti ➡️", callback_data=f"{PENDING_PAGE}{page+1}"))
+    if nav:
+        kb.append(nav)
+
+    markup = InlineKeyboardMarkup(kb)
+    text = "\n".join(lines)
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+    else:
+        await update.effective_chat.send_message(text, parse_mode="Markdown", reply_markup=markup)
+
+async def admin_pending_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, recharge_id: int):
+    import aiosqlite
+    DB_PATH = os.getenv("DB_PATH", "kwh_slots.db")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT photo_file_id, kwh, slot, user_chat_id FROM recharges WHERE id=? AND status='pending'",
+            (recharge_id,),
+        )
+        row = await cur.fetchone()
+
+    if not row or not row[0]:
+        await update.callback_query.answer("Foto non disponibile.", show_alert=True)
+        return
+
+    file_id, kwh, slot, chat_id = row
+    caption = f"#{recharge_id} — {kwh} kWh (slot {slot}) da {chat_id}"
+    await update.effective_chat.send_photo(photo=file_id, caption=caption)
+    await update.callback_query.answer()
+
+# ---- Commands/Callbacks entry points ----
+async def admin_pending_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user and update.effective_user.id not in get_admin_ids():
+        await update.effective_chat.send_message("Non sei autorizzato.")
+        return
+    await admin_pending_render(update, context, page=0)
+
+async def cb_pending_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = update.callback_query.data or ""
+    page = int(data.replace(PENDING_PAGE, "") or "0")
+    await admin_pending_render(update, context, page=page)
+
+async def cb_pending_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = update.callback_query.data or ""
+    rid = int(data.replace(PENDING_PHOTO, "") or "0")
+    if rid <= 0:
+        await update.callback_query.answer("ID non valido", show_alert=True)
+        return
+    await admin_pending_photo(update, context, recharge_id=rid)
+
+# ---- Optional: declaration photo handler (store file_id) ----
+async def on_declaration_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Attach this to the part of your declaration flow that receives the user's photo.
+       Requires a 'recharges' table with column 'photo_file_id' TEXT and 'status' TEXT."""
+    msg = update.message
+    if not msg or not msg.photo:
+        await update.effective_chat.send_message(
+            "Per favore invia una *foto* come prova della ricarica.", parse_mode="Markdown"
+        )
+        return
+
+    file_id = msg.photo[-1].file_id
+    context.user_data["decl_photo_file_id"] = file_id
+
+    import aiosqlite, time
+    DB_PATH = os.getenv("DB_PATH", "kwh_slots.db")
+    user_chat_id = update.effective_user.id if update.effective_user else None
+    kwh = context.user_data.get("decl_kwh")
+    slot = context.user_data.get("decl_slot")
+    note = context.user_data.get("decl_note", "")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO recharges (user_chat_id, kwh, slot, note, photo_file_id, status, created_at) VALUES (?,?,?,?,?,?,?)",
+            (user_chat_id, kwh, slot, note, file_id, "pending", int(time.time())),
+        )
+        await db.commit()
+
+    await update.effective_chat.send_message(
+        "✅ *Dichiarazione inviata!* Ti avviseremo appena un admin la verifica.", parse_mode="Markdown"
+    )
+    try:
+        await notify_admins(context.application, f"🆕 Nuova richiesta in attesa: {kwh} kWh (slot {slot}) da {user_chat_id}")
+    except Exception:
+        pass
+
+# ---- Auto-register these handlers by wrapping factory ----
+def _register_patch_handlers(application):
+    try:
+        application.add_handler(CommandHandler("pending", admin_pending_entry))
+        application.add_handler(CallbackQueryHandler(cb_pending_page, pattern=f"^{PENDING_PAGE}"))
+        application.add_handler(CallbackQueryHandler(cb_pending_photo, pattern=f"^{PENDING_PHOTO}"))
+    except Exception:
+        # don't break app if handlers already exist
+        pass
+    return application
+
+# Wrap existing factory build_application / create_application if present
+try:
+    _ORIG_BUILD_APP = build_application  # type: ignore
+    def build_application(*args, **kwargs):  # type: ignore
+        app = _ORIG_BUILD_APP(*args, **kwargs)
+        return _register_patch_handlers(app)
+except NameError:
+    pass
+
+try:
+    _ORIG_CREATE_APP = create_application  # type: ignore
+    def create_application(*args, **kwargs):  # type: ignore
+        app = _ORIG_CREATE_APP(*args, **kwargs)
+        return _register_patch_handlers(app)
+except NameError:
+    pass
+
+# --- End of PATCHED EXTENSIONS ---
