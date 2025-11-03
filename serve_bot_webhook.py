@@ -1,4 +1,4 @@
-# serve_bot_webhook.py (revision: drop resolve_used_update_types for wider PTB compatibility)
+# serve_bot_webhook.py (fixed indentation + PTB 21.x compat)
 import os
 import logging
 from typing import Optional
@@ -9,7 +9,9 @@ from fastapi.responses import JSONResponse
 from telegram import Update
 from telegram.error import TelegramError
 
+
 def _get_app_factory():
+    # Try create_application first, then build_application
     try:
         from bot_slots_flow import create_application as factory  # type: ignore
         logging.getLogger("railway").info("Using create_application() from bot_slots_flow.py")
@@ -20,9 +22,10 @@ def _get_app_factory():
         from bot_slots_flow import build_application as factory  # type: ignore
         logging.getLogger("railway").info("Using build_application() from bot_slots_flow.py")
         return factory
-    except Exception as e:
+    except Exception:
         logging.getLogger("railway").exception("Cannot import application factory from bot_slots_flow.py")
         raise
+
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -43,18 +46,22 @@ if not PUBLIC_URL:
 app = FastAPI(title="CalimerosBot Webhook on Railway")
 _application = None  # telegram.ext.Application instance
 
+
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "calimerosbot", "webhook_path": WEBHOOK_PATH}
+
 
 @app.get("/live")
 async def liveness():
     return {"ok": True}
 
+
 @app.get("/ready")
 async def readiness():
     ready = _application is not None
     return {"ok": ready}
+
 
 @app.on_event("startup")
 async def on_startup():
@@ -68,7 +75,7 @@ async def on_startup():
 
     url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
     try:
-        # Do NOT pass allowed_updates to be compatible across PTB versions
+        # Do NOT pass allowed_updates to keep wider PTB compatibility
         await _application.bot.set_webhook(
             url=url,
             secret_token=WEBHOOK_SECRET_TOKEN
@@ -79,6 +86,7 @@ async def on_startup():
         raise
 
     log.info("PTB application started. Ready to receive updates at %s", url)
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -91,6 +99,7 @@ async def on_shutdown():
         await _application.stop()
         await _application.shutdown()
         log.info("PTB application stopped.")
+
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
