@@ -1,4 +1,4 @@
-# serve_bot_webhook.py (PTB 21.x + FastAPI)
+# serve_bot_webhook.py (revision: drop resolve_used_update_types for wider PTB compatibility)
 import os
 import logging
 from typing import Optional
@@ -8,7 +8,6 @@ from fastapi.responses import JSONResponse
 
 from telegram import Update
 from telegram.error import TelegramError
-
 
 def _get_app_factory():
     try:
@@ -21,10 +20,9 @@ def _get_app_factory():
         from bot_slots_flow import build_application as factory  # type: ignore
         logging.getLogger("railway").info("Using build_application() from bot_slots_flow.py")
         return factory
-    except Exception:
+    except Exception as e:
         logging.getLogger("railway").exception("Cannot import application factory from bot_slots_flow.py")
         raise
-
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -42,25 +40,21 @@ if not TELEGRAM_TOKEN:
 if not PUBLIC_URL:
     log.error("Missing PUBLIC_URL env var (e.g., https://<your-app>.up.railway.app)")
 
-app = FastAPI(title="SaldoBot Webhook on Railway")
+app = FastAPI(title="CalimerosBot Webhook on Railway")
 _application = None  # telegram.ext.Application instance
-
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "saldo-bot", "webhook_path": WEBHOOK_PATH}
-
+    return {"status": "ok", "service": "calimerosbot", "webhook_path": WEBHOOK_PATH}
 
 @app.get("/live")
 async def liveness():
     return {"ok": True}
 
-
 @app.get("/ready")
 async def readiness():
     ready = _application is not None
     return {"ok": ready}
-
 
 @app.on_event("startup")
 async def on_startup():
@@ -68,19 +62,23 @@ async def on_startup():
     factory = _get_app_factory()
     _application = factory(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else factory()
 
+    # Initialize/start PTB app
     await _application.initialize()
     await _application.start()
 
     url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
     try:
-        await _application.bot.set_webhook(url=url, secret_token=WEBHOOK_SECRET_TOKEN)
+        # Do NOT pass allowed_updates to be compatible across PTB versions
+        await _application.bot.set_webhook(
+            url=url,
+            secret_token=WEBHOOK_SECRET_TOKEN
+        )
         log.info(f"Webhook set to {url} (secret={bool(WEBHOOK_SECRET_TOKEN)})")
     except TelegramError as e:
         log.exception("Failed to set webhook: %s", e)
         raise
 
     log.info("PTB application started. Ready to receive updates at %s", url)
-
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -93,7 +91,6 @@ async def on_shutdown():
         await _application.stop()
         await _application.shutdown()
         log.info("PTB application stopped.")
-
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
