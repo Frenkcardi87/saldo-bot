@@ -1,4 +1,4 @@
-# serve_bot_webhook.py (revision: drop resolve_used_update_types for wider PTB compatibility)
+# serve_bot_webhook.py (revision: fixed indentation + robust startup)
 import os
 import logging
 from typing import Optional
@@ -10,6 +10,7 @@ from telegram import Update
 from telegram.error import TelegramError
 
 def _get_app_factory():
+    # Try create_application, then build_application from bot_slots_flow
     try:
         from bot_slots_flow import create_application as factory  # type: ignore
         logging.getLogger("railway").info("Using create_application() from bot_slots_flow.py")
@@ -20,7 +21,7 @@ def _get_app_factory():
         from bot_slots_flow import build_application as factory  # type: ignore
         logging.getLogger("railway").info("Using build_application() from bot_slots_flow.py")
         return factory
-    except Exception as e:
+    except Exception:
         logging.getLogger("railway").exception("Cannot import application factory from bot_slots_flow.py")
         raise
 
@@ -64,7 +65,7 @@ async def on_startup():
 
     # Initialize/start PTB app
     await _application.initialize()
-    await _application.start()
+    await __application.start()
 
     url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
     try:
