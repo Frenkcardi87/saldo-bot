@@ -10,8 +10,6 @@ from telegram import Update
 from telegram.error import TelegramError
 
 def _get_app_factory():
-    """Return the application factory function from bot_slots_flow."""
-    # NOTE: This file had critical indentation errors. Fixed below.
     try:
         from bot_slots_flow import create_application as factory  # type: ignore
         logging.getLogger("railway").info("Using create_application() from bot_slots_flow.py")
@@ -101,9 +99,9 @@ async def telegram_webhook(request: Request):
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Application not ready")
 
     if WEBHOOK_SECRET_TOKEN:
-        header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-        if header != WEBHOOK_SECRET_TOKEN:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid secret token")
+    header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if header != WEBHOOK_SECRET_TOKEN:
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid secret token")
 
     try:
     data = await request.json()
