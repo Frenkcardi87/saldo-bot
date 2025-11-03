@@ -463,8 +463,9 @@ class ADState(IntEnum):
 
 # ---- Commands ----
 
+from telegram.constants import ParseMode
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Safe /start."""
     try:
         await init_db()
     except Exception as e:
@@ -472,53 +473,50 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
     chat = update.effective_chat
-    try:
-        if user:
-            await ensure_user(user.id, getattr(user, "full_name", None))
-    except Exception as e:
-        log.exception("ENSURE_USER_FAILED: %s", e)
-
-    _log_event("CMD_START", tg_id=(user.id if user else None), name=(getattr(user, "full_name", None)))
+    if user:
+        await ensure_user(user.id, getattr(user, "full_name", None))
 
     if user and (user.id in ADMIN_IDS):
         msg = (
-            f"👋 *Admin* — saldo-bot v{__VERSION__}\n\n"
+            f"👋 *Admin* — saldo‑bot v{__VERSION__}\n\n"
             "Pannello rapido:\n"
             "• ➕ *Ricarica*: accredita kWh a un utente\n"
             "• ➖ *Addebita*: addebita kWh a un utente\n\n"
             "ℹ️ *Comandi disponibili*\n"
             "• /saldo — mostra i tuoi kWh\n"
-            "• /ricarica <slot1|slot3|slot5|slot8|wallet> <kwh>\n"
-            "• Invia foto con didascalia: `slot3 4.5`\n\n"
-            "👮 *Admin:*\n"
+            "• /ricarica slotX quantita\n\n"
+            "👮 *Admin extra*\n"
             "• /pending — richieste in attesa\n"
-            "• /approve <id> — approva richiesta\n"
-            "• /reject <id> — rifiuta richiesta\n"
-            "• /users — ultimi utenti con saldi\n"
-            "• /credita <chat_id> <slot> <kwh>\n\n"
-            "_Extra:_ /allow_negative, /export_ops\n"
-            f"_DB:_ `{DB_PATH}`"
+            "• /approve id — approva richiesta\n"
+            "• /reject id — rifiuta richiesta\n"
+            "• /users — lista utenti e saldi\n"
+            "• /credita chat_id slot kwh\n"
+            "• /allow_negative <id> on|off|default\n"
+            "• /export_ops — esporta storici\n\n"
+            f"DB: `{DB_PATH}`"
         )
         kb = admin_home_kb()
     else:
         msg = (
-            f"👋 Ciao! Questo è *saldo-bot* v{__VERSION__}.\n\n"
-            "ℹ️ *Comandi*\n"
+            f"👋 Ciao {user.first_name if user else ''}! Questo è saldo‑bot v{__VERSION__}.\n\n"
+            "Comandi:\n"
             "• /saldo — mostra i tuoi kWh\n"
-            "• /ricarica <slot1|slot3|slot5|slot8|wallet> <kwh>\n"
-            "• Invia foto con didascalia: `slot3 4.5`\n\n"
-            "Se ti serve assistenza contatta un amministratore."
+            "• /storico — ultime operazioni\n"
+            "• /ricarica slotX quantita\n"
         )
         kb = None
 
     try:
-        if chat:
-            await context.bot.send_message(chat_id=chat.id, text=msg, parse_mode="Markdown", reply_markup=kb)
-        elif update.message:
-            await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+        await context.bot.send_message(
+            chat_id=chat.id, 
+            text=msg, 
+            parse_mode=ParseMode.MARKDOWN_V2, 
+            reply_markup=kb
+        )
     except Exception as e:
         log.exception("START_REPLY_FAILED: %s", e)
-
+        # fallback senza parse_mode per sicurezza
+        await context.bot.send_message(chat_id=chat.id, text=msg, reply_markup=kb)
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
