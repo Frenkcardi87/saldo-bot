@@ -1917,7 +1917,7 @@ def build_application(token: str | None = None) -> Application:
     app.add_handler(cr_conv, group=0)
 
     # Photo with caption handler (NEW)
-    app.add_handler(MessageHandler(filters.PHOTO & filters.Caption.TEXT, on_photo_with_caption), group=1)
+    app.add_handler(MessageHandler(filters.PHOTO & filters.CAPTION, on_photo_with_caption), group=1)
 
     # Credit request approval/rejection callbacks (NEW)
     app.add_handler(CallbackQueryHandler(on_cr_approve, pattern="^CR_APPROVE:\\d+$"), group=0)
