@@ -726,7 +726,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• /export_ops — esporta operazioni CSV\n"
             "• /addebita <user_id> <kwh> [slot] — addebito manuale\n"
             "• /allow_negative <user_id> on|off|default\n\n"
-            f"_DB: {DB_PATH}_"
+            f"DB: `{DB_PATH}`"
         )
         kb = admin_home_kb()
     else:
