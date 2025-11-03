@@ -99,20 +99,20 @@ async def telegram_webhook(request: Request):
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Application not ready")
 
     if WEBHOOK_SECRET_TOKEN:
-    header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-    if header != WEBHOOK_SECRET_TOKEN:
-    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid secret token")
+        header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if header != WEBHOOK_SECRET_TOKEN:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid secret token")
 
     try:
-    data = await request.json()
+        data = await request.json()
     except Exception:
-    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON")
 
     try:
-    update = Update.de_json(data, _application.bot)
-    await _application.process_update(update)
+        update = Update.de_json(data, _application.bot)
+        await _application.process_update(update)
     except Exception as e:
-    log.exception("Failed to process update: %s", e)
-    return JSONResponse(status_code=200, content={"ok": False})
+        log.exception("Failed to process update: %s", e)
+        return JSONResponse(status_code=200, content={"ok": False})
 
     return {"ok": True}
