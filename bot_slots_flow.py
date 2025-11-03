@@ -192,7 +192,7 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_credit_req_status ON credit_requests(status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_credit_req_user ON credit_requests(user_id)")
         await db.commit()
-        _log_event("DB_INIT_DONE")
+    _log_event("DB_INIT_DONE")
 
 # ---- Helpers ----
 
@@ -351,7 +351,7 @@ async def approve_credit_request(request_id: int, admin_id: int) -> tuple[bool, 
             await db.commit()
             _log_event("CREDIT_REQUEST_APPROVED", request_id=request_id, user_id=user_id, kwh=kwh, admin=admin_id)
             return True, f"Saldo: {current_balance:.2f} → {new_balance:.2f} kWh"
-            
+        
         except Exception as e:
             try:
                 await db.execute("ROLLBACK")
@@ -386,7 +386,7 @@ async def reject_credit_request(request_id: int, admin_id: int, reason: str | No
             await db.commit()
             _log_event("CREDIT_REQUEST_REJECTED", request_id=request_id, admin=admin_id, reason=reason)
             return True, "Richiesta rifiutata"
-            
+        
         except Exception as e:
             log.exception("Error rejecting credit request: %s", e)
             return False, f"Errore: {str(e)}"
@@ -676,26 +676,26 @@ class ACState(IntEnum):
     SELECT_USER = 1
     ASK_AMOUNT  = 2
     ASK_SLOT    = 3
-    CONFIRM     = 4
+    CONFIRM    = 4
     FIND_USER   = 5
 
 class ADState(IntEnum):
     SELECT_USER = 11
     ASK_AMOUNT  = 12
     ASK_SLOT    = 13
-    CONFIRM     = 14
+    CONFIRM    = 14
     FIND_USER   = 15
 
 class CRState(IntEnum):  # Credit Request (User flow)
     ASK_SLOT    = 20
-    ASK_KWH     = 21
+    ASK_KWH    = 21
     ASK_PHOTO   = 22
     ASK_NOTE    = 23
-    CONFIRM     = 24
+    CONFIRM    = 24
 
-# ====================
+# ====
 # COMMANDS
-# ====================
+# ====
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command with different messages for admin vs users"""
@@ -1013,9 +1013,9 @@ async def cmd_allow_negative(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"(Globale: {'ON' if g else 'OFF'}; Override: {('ON' if user_override else 'OFF') if user_override is not None else '—'})"
     )
 
-# ====================
+# ====
 # ADMIN CREDIT FLOW (AC) - Existing admin functions
-# ====================
+# ====
 
 async def on_ac_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1101,17 +1101,16 @@ async def on_ac_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _log_event("AC_AMOUNT_SET", amount=amount)
     
     # Build slot buttons dynamically from SLOTS env
+    kb_rows = []
     slot_buttons = []
-    for slot in SLOTS[:3]:  # First 3 in a row
+    for i, slot in enumerate(SLOTS):
         slot_buttons.append(InlineKeyboardButton(slot.title(), callback_data=f"ACS:{slot}"))
+        if (i + 1) % 3 == 0:  # 3 buttons per row
+            kb_rows.append(slot_buttons)
+            slot_buttons = []
     
-    kb_rows = [slot_buttons]
-    if len(SLOTS) > 3:
-        more_buttons = []
-        for slot in SLOTS[3:6]:  # Next 3 in another row
-            more_buttons.append(InlineKeyboardButton(slot.title(), callback_data=f"ACS:{slot}"))
-        if more_buttons:
-            kb_rows.append(more_buttons)
+    if slot_buttons:  # Add remaining buttons
+        kb_rows.append(slot_buttons)
     
     kb_rows.append([InlineKeyboardButton("Salta", callback_data="ACS:-")])
     kb = InlineKeyboardMarkup(kb_rows)
@@ -1204,9 +1203,9 @@ async def on_ac_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("\n".join(lines), parse_mode="Markdown")
     return ACState.SELECT_USER
 
-# ====================
+# ====
 # ADMIN DEBIT FLOW (AD) - Existing admin functions
-# ====================
+# ====
 
 async def on_ad_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1250,696 +1249,4 @@ async def on_ad_find_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = await search_users_by_name(qtxt)
     _log_event("AD_FIND", query=qtxt, results=len(rows))
     if not rows:
-        await update.message.reply_text("Nessun risultato. Riprova.")
-        return ADState.FIND_USER
-    await update.message.reply_text(
-        f"Risultati per "{qtxt}":",
-        reply_markup=build_search_kb(rows, qtxt)
-    )
-    return ADState.SELECT_USER
-
-async def on_ad_pick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not _is_admin(q.from_user.id):
-        return ConversationHandler.END
-    if not (q.data.startswith("ACU:") or q.data.startswith("ADU:")):
-        return ConversationHandler.END
-    uid = int(q.data.split(":",1)[1])
-    context.user_data.setdefault('ad', {})['user_id'] = uid
-    _log_event("AD_PICK_USER", admin=q.from_user.id, user_id=uid)
-
-    await q.edit_message_text("Inserisci la quantità di kWh da addebitare (es. 5 o 7,5).")
-    return ADState.ASK_AMOUNT
-
-async def on_ad_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.message.text or "").strip()
-    if not _is_number(txt):
-        await update.message.reply_text("Valore non valido. Inserisci un numero (es. 5 oppure 7,5).")
-        return ADState.ASK_AMOUNT
-    amount = round(float(txt.replace(",", ".")), 3)
-    if amount <= 0:
-        await update.message.reply_text("L'importo deve essere maggiore di zero.")
-        return ADState.ASK_AMOUNT
-    if amount > MAX_CREDIT_PER_OP:
-        await update.message.reply_text(f"Massimo per singola operazione: {MAX_CREDIT_PER_OP:g}.")
-        return ADState.ASK_AMOUNT
-
-    context.user_data['ad']['amount'] = amount
-    _log_event("AD_AMOUNT_SET", amount=amount)
-    
-    # Build slot buttons dynamically
-    slot_buttons = []
-    for slot in SLOTS[:3]:
-        slot_buttons.append(InlineKeyboardButton(slot.title(), callback_data=f"ADS:{slot}"))
-    
-    kb_rows = [slot_buttons]
-    if len(SLOTS) > 3:
-        more_buttons = []
-        for slot in SLOTS[3:6]:
-            more_buttons.append(InlineKeyboardButton(slot.title(), callback_data=f"ADS:{slot}"))
-        if more_buttons:
-            kb_rows.append(more_buttons)
-    
-    kb_rows.append([InlineKeyboardButton("Salta", callback_data="ADS:-")])
-    kb = InlineKeyboardMarkup(kb_rows)
-    
-    await update.message.reply_text(
-        f"Ok, addebito **{amount:g} kWh**.\nVuoi indicare lo slot?",
-        reply_markup=kb,
-        parse_mode="Markdown"
-    )
-    return ADState.ASK_SLOT
-
-async def on_ad_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    slot = None
-    if q.data.startswith("ADS:"):
-        _s = q.data.split(":",1)[1]
-        slot = None if _s == "-" else _s
-    context.user_data['ad']['slot'] = slot
-    _log_event("AD_SLOT_SET", slot=slot)
-
-    data = context.user_data['ad']
-    uid = data['user_id']; amount = data['amount']; slot = data.get('slot')
-    text = f"Confermi l'*addebito* di **{amount:g} kWh** all'utente `{uid}`" + (f" (slot {slot})" if slot else "") + "?"
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Conferma", callback_data="ADD:OK"),
-         InlineKeyboardButton("❌ Annulla",  callback_data="ADD:NO")]
-    ])
-    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
-    return ADState.CONFIRM
-
-async def on_ad_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if q.data == "ADD:NO":
-        await q.edit_message_text("Operazione annullata.")
-        return ConversationHandler.END
-
-    data = context.user_data.get('ad', {})
-    uid = data['user_id']
-    amount = data['amount']
-    slot = data.get('slot')
-    admin_id = q.from_user.id
-
-    ok, old_bal, new_bal = await addebita_kwh(uid, amount, slot, admin_id)
-    if not ok:
-        _log_event("AD_DEBIT_FAIL", user_id=uid, amount=amount)
-        if old_bal is not None and new_bal is not None and old_bal == new_bal and (old_bal - amount) < 0:
-            await q.edit_message_text("❗ Saldo insufficiente e negativo non consentito per questo utente.")
-        else:
-            await q.edit_message_text("❗ Errore (limiti/policy). Operazione annullata.")
-        return ConversationHandler.END
-
-    name = await _get_user_name(uid)
-    summary = (
-        f"✅ *Addebito completato*\n\n"
-        f"*Utente:* {name or uid}\n"
-        f"*Quantità:* {amount:g} kWh{f' (slot {slot})' if slot else ''}\n\n"
-        f"*Saldo prima:* {old_bal:.2f} kWh\n"
-        f"*Saldo dopo:*  {new_bal:.2f} kWh"
-    )
-    await q.edit_message_text(summary, parse_mode="Markdown")
-
-    try:
-        tg = await get_tgid_by_userid(uid)
-        if tg:
-            await context.bot.send_message(
-                chat_id=tg,
-                text=f"⚠️ Ti sono stati *addebitati* {amount:g} kWh.\nSaldo: {old_bal:.2f} → {new_bal:.2f} kWh",
-                parse_mode="Markdown"
-            )
-    except Exception:
-        pass
-    _log_event("AD_DEBIT_OK", user_id=uid, amount=amount, old=old_bal, new=new_bal)
-
-    return ConversationHandler.END
-
-# ====================
-# USER CREDIT REQUEST FLOW (CR) - NEW
-# ====================
-
-async def cmd_ricarica(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start credit request flow for users"""
-    user_id = update.effective_user.id
-    await ensure_user(user_id, update.effective_user.full_name)
-    
-    # Check pending requests limit
-    pending_count = await count_user_pending_requests(user_id)
-    if pending_count >= MAX_PENDING_REQUESTS:
-        await update.message.reply_text(
-            f"⚠️ Hai già {pending_count} richieste in attesa.\n"
-            f"Massimo consentito: {MAX_PENDING_REQUESTS}.\n"
-            f"Attendi che vengano elaborate prima di inviarne altre."
-        )
-        return ConversationHandler.END
-    
-    context.user_data['cr'] = {}
-    _log_event("CR_START", user_id=user_id)
-    
-    # Build slot selection keyboard
-    slot_buttons = []
-    for i, slot in enumerate(SLOTS):
-        slot_buttons.append(InlineKeyboardButton(slot.title(), callback_data=f"CRS:{slot}"))
-        if (i + 1) % 3 == 0:  # 3 buttons per row
-            kb_rows = slot_buttons if 'kb_rows' not in locals() else kb_rows + [slot_buttons]
-            slot_buttons = []
-    
-    if slot_buttons:  # Add remaining buttons
-        kb_rows = slot_buttons if 'kb_rows' not in locals() else kb_rows + [slot_buttons]
-    else:
-        kb_rows = []
-    
-    kb = InlineKeyboardMarkup(kb_rows if kb_rows else [[InlineKeyboardButton("Wallet", callback_data="CRS:wallet")]])
-    
-    await update.message.reply_text(
-        "📋 *Richiesta di Ricarica*\n\n"
-        "Seleziona lo slot da ricaricare:",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
-    return CRState.ASK_SLOT
-
-async def on_cr_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle slot selection"""
-    q = update.callback_query
-    await q.answer()
-    
-    slot = q.data.split(":",1)[1]
-    context.user_data['cr']['slot'] = slot
-    _log_event("CR_SLOT_SET", slot=slot)
-    
-    await q.edit_message_text(
-        f"📍 Slot selezionato: *{slot}*\n\n"
-        f"Inserisci la quantità di kWh da ricaricare (es. 10 o 12,5):",
-        parse_mode="Markdown"
-    )
-    return CRState.ASK_KWH
-
-async def on_cr_kwh(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle kWh input"""
-    txt = (update.message.text or "").strip()
-    if not _is_number(txt):
-        await update.message.reply_text("⚠️ Valore non valido. Inserisci un numero (es. 10 oppure 12,5).")
-        return CRState.ASK_KWH
-    
-    kwh = round(float(txt.replace(",", ".")), 3)
-    if kwh <= 0:
-        await update.message.reply_text("⚠️ La quantità deve essere maggiore di zero.")
-        return CRState.ASK_KWH
-    
-    context.user_data['cr']['kwh'] = kwh
-    _log_event("CR_KWH_SET", kwh=kwh)
-    
-    await update.message.reply_text(
-        f"⚡ kWh: *{kwh:g}*\n\n"
-        f"📸 Invia ora la *foto* della ricarica come prova.\n"
-        f"_(Obbligatorio)_",
-        parse_mode="Markdown"
-    )
-    return CRState.ASK_PHOTO
-
-async def on_cr_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle photo upload"""
-    if not update.message.photo:
-        await update.message.reply_text("⚠️ Devi inviare una foto. Riprova.")
-        return CRState.ASK_PHOTO
-    
-    # Download and save photo
-    photo = update.message.photo[-1]  # Highest resolution
-    file = await context.bot.get_file(photo.file_id)
-    
-    # Generate unique filename
-    user_id = update.effective_user.id
-    filename = f"{user_id}_{uuid.uuid4().hex[:8]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-    photo_path = os.path.join(CREDIT_PHOTOS_PATH, filename)
-    
-    try:
-        await file.download_to_drive(photo_path)
-        context.user_data['cr']['photo_path'] = photo_path
-        _log_event("CR_PHOTO_SAVED", path=photo_path)
-    except Exception as e:
-        log.exception("Failed to save photo: %s", e)
-        await update.message.reply_text("❗ Errore nel salvataggio della foto. Riprova.")
-        return CRState.ASK_PHOTO
-    
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏩ Salta", callback_data="CRN:skip")]
-    ])
-    
-    await update.message.reply_text(
-        "✅ Foto ricevuta!\n\n"
-        "📝 Vuoi aggiungere una nota opzionale?\n"
-        "_(Scrivi la nota o premi Salta)_",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
-    return CRState.ASK_NOTE
-
-async def on_cr_skip_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle skip note button"""
-    q = update.callback_query
-    await q.answer()
-    
-    context.user_data['cr']['note'] = None
-    
-    # Show confirmation
-    data = context.user_data['cr']
-    slot = data['slot']
-    kwh = data['kwh']
-    
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Conferma", callback_data="CRC:OK"),
-         InlineKeyboardButton("❌ Annulla", callback_data="CRC:NO")]
-    ])
-    
-    await q.edit_message_text(
-        f"📋 *Riepilogo Richiesta*\n\n"
-        f"📍 Slot: {slot}\n"
-        f"⚡ kWh: {kwh:g}\n"
-        f"📸 Foto: allegata\n"
-        f"📝 Nota: _nessuna_\n\n"
-        f"Confermi l'invio?",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
-    return CRState.CONFIRM
-
-async def on_cr_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle note input"""
-    note = (update.message.text or "").strip()
-    context.user_data['cr']['note'] = note if note else None
-    
-    # Show confirmation
-    data = context.user_data['cr']
-    slot = data['slot']
-    kwh = data['kwh']
-    note_text = note if note else "_nessuna_"
-    
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Conferma", callback_data="CRC:OK"),
-         InlineKeyboardButton("❌ Annulla", callback_data="CRC:NO")]
-    ])
-    
-    await update.message.reply_text(
-        f"📋 *Riepilogo Richiesta*\n\n"
-        f"📍 Slot: {slot}\n"
-        f"⚡ kWh: {kwh:g}\n"
-        f"📸 Foto: allegata\n"
-        f"📝 Nota: {note_text}\n\n"
-        f"Confermi l'invio?",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
-    return CRState.CONFIRM
-
-async def on_cr_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle confirmation"""
-    q = update.callback_query
-    await q.answer()
-    
-    if q.data == "CRC:NO":
-        # Clean up photo if exists
-        photo_path = context.user_data.get('cr', {}).get('photo_path')
-        if photo_path and os.path.exists(photo_path):
-            try:
-                os.remove(photo_path)
-            except Exception:
-                pass
-        
-        await q.edit_message_text("❌ Richiesta annullata.")
-        return ConversationHandler.END
-    
-    # Create credit request
-    user_id = update.effective_user.id
-    data = context.user_data['cr']
-    slot = data['slot']
-    kwh = data['kwh']
-    photo_path = data.get('photo_path')
-    note = data.get('note')
-    
-    try:
-        request_id = await create_credit_request(user_id, slot, kwh, photo_path, note)
-        _log_event("CR_CREATED", request_id=request_id, user_id=user_id, slot=slot, kwh=kwh)
-        
-        await q.edit_message_text(
-            f"✅ *Richiesta inviata con successo!*\n\n"
-            f"📋 Richiesta #{request_id}\n"
-            f"📍 Slot: {slot}\n"
-            f"⚡ kWh: {kwh:g}\n\n"
-            f"Ti avviseremo appena un amministratore la verifica.\n"
-            f"Usa /pending per controllare lo stato.",
-            parse_mode="Markdown"
-        )
-        
-        # Notify admins
-        await notify_admins(context, request_id, user_id, slot, kwh, photo_path, note)
-        
-    except Exception as e:
-        log.exception("Failed to create credit request: %s", e)
-        await q.edit_message_text("❗ Errore nella creazione della richiesta. Riprova più tardi.")
-    
-    return ConversationHandler.END
-
-# ====================
-# PHOTO WITH CAPTION HANDLER - NEW
-# ====================
-
-async def on_photo_with_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle photo messages with caption in format: slot3 4.5 [note]"""
-    if not update.message.photo or not update.message.caption:
-        return
-    
-    user_id = update.effective_user.id
-    await ensure_user(user_id, update.effective_user.full_name)
-    
-    # Check pending limit
-    pending_count = await count_user_pending_requests(user_id)
-    if pending_count >= MAX_PENDING_REQUESTS:
-        await update.message.reply_text(
-            f"⚠️ Hai già {pending_count} richieste in attesa.\n"
-            f"Massimo: {MAX_PENDING_REQUESTS}. Attendi l'elaborazione."
-        )
-        return
-    
-    # Parse caption
-    caption = update.message.caption.strip()
-    parts = caption.split(maxsplit=2)
-    
-    if len(parts) < 2:
-        await update.message.reply_text(
-            "⚠️ Formato non valido.\n"
-            "Usa: `slot3 4.5` o `slot8 10 nota opzionale`",
-            parse_mode="Markdown"
-        )
-        return
-    
-    slot = parts[0].lower()
-    kwh_str = parts[1].replace(",", ".")
-    note = parts[2] if len(parts) > 2 else None
-    
-    # Validate slot
-    if slot not in [s.lower() for s in SLOTS]:
-        await update.message.reply_text(
-            f"⚠️ Slot non valido: {slot}\n"
-            f"Slot disponibili: {', '.join(SLOTS)}",
-            parse_mode="Markdown"
-        )
-        return
-    
-    # Validate kWh
-    if not _is_number(kwh_str):
-        await update.message.reply_text("⚠️ Quantità kWh non valida.")
-        return
-    
-    kwh = round(float(kwh_str), 3)
-    if kwh <= 0:
-        await update.message.reply_text("⚠️ La quantità deve essere maggiore di zero.")
-        return
-    
-    # Download photo
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    filename = f"{user_id}_{uuid.uuid4().hex[:8]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-    photo_path = os.path.join(CREDIT_PHOTOS_PATH, filename)
-    
-    try:
-        await file.download_to_drive(photo_path)
-    except Exception as e:
-        log.exception("Failed to save photo: %s", e)
-        await update.message.reply_text("❗ Errore nel salvataggio della foto.")
-        return
-    
-    # Create request
-    try:
-        request_id = await create_credit_request(user_id, slot, kwh, photo_path, note)
-        _log_event("CR_CREATED_PHOTO", request_id=request_id, user_id=user_id, slot=slot, kwh=kwh)
-        
-        await update.message.reply_text(
-            f"✅ *Richiesta inviata!*\n\n"
-            f"📋 #{request_id}\n"
-            f"📍 {slot} | ⚡ {kwh:g} kWh\n"
-            f"{'📝 ' + note if note else ''}\n\n"
-            f"Ti avviseremo dell'esito.",
-            parse_mode="Markdown"
-        )
-        
-        # Notify admins
-        await notify_admins(context, request_id, user_id, slot, kwh, photo_path, note)
-        
-    except Exception as e:
-        log.exception("Failed to create credit request from photo: %s", e)
-        await update.message.reply_text("❗ Errore nella creazione della richiesta.")
-
-# ====================
-# CREDIT REQUEST APPROVAL/REJECTION CALLBACKS - NEW
-# ====================
-
-async def on_cr_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle credit request approval"""
-    q = update.callback_query
-    await q.answer()
-    
-    if not _is_admin(q.from_user.id):
-        await q.answer("Non sei autorizzato.", show_alert=True)
-        return
-    
-    request_id = int(q.data.split(":")[1])
-    admin_id = q.from_user.id
-    
-    # Get request details before approval
-    req = await get_credit_request(request_id)
-    if not req:
-        await q.edit_message_reply_markup(reply_markup=None)
-        await q.message.reply_text("⚠️ Richiesta non trovata.")
-        return
-    
-    _, user_id, slot, kwh, photo_path, note, status, created_at, _, _ = req
-    
-    if status != 'pending':
-        await q.edit_message_reply_markup(reply_markup=None)
-        await q.message.reply_text(f"⚠️ Richiesta già {status}.")
-        return
-    
-    # Approve request
-    success, details = await approve_credit_request(request_id, admin_id)
-    
-    if success:
-        # Update message
-        admin_name = q.from_user.full_name or f"Admin {admin_id}"
-        await q.edit_message_reply_markup(reply_markup=None)
-        await q.message.reply_text(
-            f"✅ *Richiesta #{request_id} APPROVATA*\n"
-            f"da {admin_name}\n\n"
-            f"{details}",
-            parse_mode="Markdown"
-        )
-        
-        # Notify user
-        await notify_user_request_result(context, user_id, True, kwh, slot, details)
-    else:
-        await q.answer(f"❌ Errore: {details}", show_alert=True)
-
-async def on_cr_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle credit request rejection"""
-    q = update.callback_query
-    await q.answer()
-    
-    if not _is_admin(q.from_user.id):
-        await q.answer("Non sei autorizzato.", show_alert=True)
-        return
-    
-    request_id = int(q.data.split(":")[1])
-    admin_id = q.from_user.id
-    
-    # Get request details
-    req = await get_credit_request(request_id)
-    if not req:
-        await q.edit_message_reply_markup(reply_markup=None)
-        await q.message.reply_text("⚠️ Richiesta non trovata.")
-        return
-    
-    _, user_id, slot, kwh, photo_path, note, status, created_at, _, _ = req
-    
-    if status != 'pending':
-        await q.edit_message_reply_markup(reply_markup=None)
-        await q.message.reply_text(f"⚠️ Richiesta già {status}.")
-        return
-    
-    # Reject request
-    success, details = await reject_credit_request(request_id, admin_id, "Rejected by admin")
-    
-    if success:
-        # Update message
-        admin_name = q.from_user.full_name or f"Admin {admin_id}"
-        await q.edit_message_reply_markup(reply_markup=None)
-        await q.message.reply_text(
-            f"❌ *Richiesta #{request_id} RIFIUTATA*\n"
-            f"da {admin_name}",
-            parse_mode="Markdown"
-        )
-        
-        # Notify user
-        await notify_user_request_result(context, user_id, False, kwh, slot, "")
-    else:
-        await q.answer(f"❌ Errore: {details}", show_alert=True)
-
-# ====================
-# MISC HANDLERS
-# ====================
-
-async def on_admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        _log_event("CMD_ADMIN_MENU", caller=update.effective_user.id)
-        await update.message.reply_text("Pannello admin:", reply_markup=admin_home_kb())
-
-async def on_allowneg_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not _is_admin(q.from_user.id):
-        await q.edit_message_text("Funzione riservata agli admin.")
-        return
-    _, payload = q.data.split("ALN_SET:",1)
-    uid_str, mode = payload.split(":")
-    uid = int(uid_str)
-
-    target = None if mode=="default" else (mode=="on")
-    ok = await set_user_allow_negative(uid, target)
-    if not ok:
-        await q.edit_message_text(f"Utente {uid} non trovato.")
-        return
-    kb = await build_user_admin_kb(uid)
-    try:
-        await q.edit_message_reply_markup(reply_markup=kb)
-    except Exception:
-        eff, source, user_override, g = await get_user_negative_policy(uid)
-        src = "override UTENTE" if source=="USER" else "DEFAULT GLOBALE"
-        await q.edit_message_text(
-            f"Allow negative per {uid}: {'ON' if eff else 'OFF'} ({src}).",
-            reply_markup=kb
-        )
-
-async def on_nop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-# ====================
-# ERROR HANDLER
-# ====================
-
-async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    err = context.error
-    log.exception("GLOBAL_ERROR: %s", err)
-
-# ====================
-# APPLICATION BUILDER
-# ====================
-
-def build_application(token: str | None = None) -> Application:
-    app = Application.builder().token(token or os.getenv("TELEGRAM_TOKEN")).build()
-
-    async def _post_init(app_: Application):
-        await init_db()
-        _log_event("APP_READY", version=__VERSION__)
-    app.post_init = _post_init
-
-    # Commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("saldo", cmd_saldo))
-    app.add_handler(CommandHandler("storico", cmd_storico))
-    app.add_handler(CommandHandler("pending", cmd_pending))
-    app.add_handler(CommandHandler("export_ops", cmd_export_ops))
-    app.add_handler(CommandHandler("addebita", cmd_addebita))
-    app.add_handler(CommandHandler("allow_negative", cmd_allow_negative))
-    app.add_handler(CommandHandler("admin", on_admin_home))
-
-    # Admin Credit flow (existing)
-    ac_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(on_ac_start, pattern="^AC_START$")],
-        states={
-            ACState.SELECT_USER: [
-                CallbackQueryHandler(on_ac_pick_user, pattern="^ACU:"),
-                CallbackQueryHandler(on_ac_users_page, pattern="^ACP:\\d+$"),
-                CallbackQueryHandler(on_ac_find_press, pattern="^AC_FIND$"),
-                CallbackQueryHandler(on_ac_history, pattern="^ACH:\\d+$"),
-            ],
-            ACState.FIND_USER:   [MessageHandler(filters.TEXT & ~filters.COMMAND, on_ac_find_query)],
-            ACState.ASK_AMOUNT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, on_ac_amount)],
-            ACState.ASK_SLOT:    [CallbackQueryHandler(on_ac_slot, pattern="^ACS:")],
-            ACState.CONFIRM:     [CallbackQueryHandler(on_ac_confirm, pattern="^ACC:(OK|NO)$")],
-        },
-        fallbacks=[],
-        name="admin_credit_flow",
-        persistent=False,
-    )
-    app.add_handler(ac_conv, group=0)
-
-    # Admin Debit flow (existing)
-    ad_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(on_ad_start, pattern="^AD_START$")],
-        states={
-            ADState.SELECT_USER: [
-                CallbackQueryHandler(on_ad_pick_user, pattern="^(ACU|ADU):"),
-                CallbackQueryHandler(on_ad_users_page, pattern="^ACP:\\d+$"),
-                CallbackQueryHandler(on_ad_find_press, pattern="^AC_FIND$"),
-            ],
-            ADState.FIND_USER:   [MessageHandler(filters.TEXT & ~filters.COMMAND, on_ad_find_query)],
-            ADState.ASK_AMOUNT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, on_ad_amount)],
-            ADState.ASK_SLOT:    [CallbackQueryHandler(on_ad_slot, pattern="^ADS:")],
-            ADState.CONFIRM:     [CallbackQueryHandler(on_ad_confirm, pattern="^ADD:(OK|NO)$")],
-        },
-        fallbacks=[],
-        name="admin_debit_flow",
-        persistent=False,
-    )
-    app.add_handler(ad_conv, group=0)
-
-    # User Credit Request flow (NEW)
-    cr_conv = ConversationHandler(
-        entry_points=[CommandHandler("ricarica", cmd_ricarica)],
-        states={
-            CRState.ASK_SLOT:   [CallbackQueryHandler(on_cr_slot, pattern="^CRS:")],
-            CRState.ASK_KWH:    [MessageHandler(filters.TEXT & ~filters.COMMAND, on_cr_kwh)],
-            CRState.ASK_PHOTO:  [MessageHandler(filters.PHOTO, on_cr_photo)],
-            CRState.ASK_NOTE:   [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, on_cr_note),
-                CallbackQueryHandler(on_cr_skip_note, pattern="^CRN:skip$")
-            ],
-            CRState.CONFIRM:    [CallbackQueryHandler(on_cr_confirm, pattern="^CRC:(OK|NO)$")],
-        },
-        fallbacks=[],
-        name="user_credit_request_flow",
-        persistent=False,
-    )
-    app.add_handler(cr_conv, group=0)
-
-    # Photo with caption handler (NEW)
-    app.add_handler(MessageHandler(filters.PHOTO & filters.Caption.TEXT, on_photo_with_caption), group=1)
-
-    # Credit request approval/rejection callbacks (NEW)
-    app.add_handler(CallbackQueryHandler(on_cr_approve, pattern="^CR_APPROVE:\\d+$"), group=0)
-    app.add_handler(CallbackQueryHandler(on_cr_reject, pattern="^CR_REJECT:\\d+$"), group=0)
-
-    # Inline misc
-    app.add_handler(CallbackQueryHandler(on_allowneg_set, pattern="^ALN_SET:\\d+:(on|off|default)$"), group=0)
-    app.add_handler(CallbackQueryHandler(on_ac_history, pattern="^ACH:\\d+$"), group=0)
-    app.add_handler(CallbackQueryHandler(on_nop, pattern="^NOP$"), group=0)
-
-    # Global error handler
-    app.add_error_handler(handle_error)
-
-    return app
-
-
-# Alias for compatibility
-create_application = build_application
-
-
-if __name__ == "__main__":
-    import sys
-    log.info("Starting bot in polling mode for testing...")
-    app = build_application()
-    app.run_polling()
+        await update.message.reply_text("Nessun
