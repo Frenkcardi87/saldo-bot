@@ -11,6 +11,7 @@
 # - Safe DB migrations for existing DBs (PRAGMA table_info) + UNIQUE index on tg_id (via CREATE UNIQUE INDEX)
 # - Global error handler for PTB
 # - Structured logging + clearer /start message with legacy commands list
+# - Hardened /start (works even if update.message is None) + /ping
 #
 # Env:
 #   TELEGRAM_TOKEN
@@ -46,7 +47,7 @@ from telegram.ext import (
 )
 from telegram.error import TelegramError
 
-__VERSION__ = "1.3.1"
+__VERSION__ = "1.3.2"
 
 # ---------- Logging ----------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -415,11 +416,24 @@ class ADState(IntEnum):
 # ---------- Commands ----------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await init_db()
+    """Safe /start: works even if update.message is None (e.g., via button/forward)."""
+    try:
+        await init_db()
+    except Exception as e:
+        log.exception("INIT_DB_FAILED: %s", e)
+
     user = update.effective_user
-    await ensure_user(user.id, user.full_name)
-    _log_event("CMD_START", tg_id=user.id, name=user.full_name)
-    if _is_admin(user.id):
+    chat = update.effective_chat
+    try:
+        if user:
+            await ensure_user(user.id, getattr(user, "full_name", None))
+    except Exception as e:
+        log.exception("ENSURE_USER_FAILED: %s", e)
+
+    _log_event("CMD_START", tg_id=(user.id if user else None), name=(getattr(user, "full_name", None)))
+
+    # Build message text
+    if user and (user.id in ADMIN_IDS):
         msg = (
             f"👋 *Admin* — saldo-bot v{__VERSION__}\n\n"
             "Pannello rapido:\n"
@@ -440,7 +454,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• `/export_ops user:<id> [dal] [al]`\n"
             f"_DB:_ `{DB_PATH}`"
         )
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=admin_home_kb())
+        kb = admin_home_kb()
     else:
         msg = (
             f"👋 Ciao! Questo è *saldo-bot* v{__VERSION__}.\n\n"
@@ -450,7 +464,25 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Invia foto con didascalia: `slot3 4.5` per allegare prova\n\n"
             "Se ti serve assistenza contatta un amministratore."
         )
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        kb = None
+
+    # Reply safely (works even without update.message)
+    try:
+        if chat:
+            await context.bot.send_message(chat_id=chat.id, text=msg, parse_mode="Markdown", reply_markup=kb)
+        elif update.message:
+            await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+    except Exception as e:
+        log.exception("START_REPLY_FAILED: %s", e)
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Quick health check command."""
+    try:
+        await update.effective_message.reply_text("pong")
+    except Exception:
+        chat = update.effective_chat
+        if chat:
+            await context.bot.send_message(chat_id=chat.id, text="pong")
 
 async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caller = update.effective_user.id
@@ -887,7 +919,7 @@ async def on_ad_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("L’importo deve essere maggiore di zero.")
         return ADState.ASK_AMOUNT
     if amount > MAX_CREDIT_PER_OP:
-        await update.message.reply_text(f"Massimo per singola operazione: {MAX_CREDIT_PER_OP:g} kWh.")
+        await update.message.reply_text(f"Massimo per singola operazione: {MAX_CREDIT_PER_OP:g}.")
         return ADState.ASK_AMOUNT
 
     context.user_data['ad']['amount'] = amount
@@ -1028,6 +1060,7 @@ def build_application(token: str | None = None) -> Application:
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("saldo", cmd_saldo))
     app.add_handler(CommandHandler("storico", cmd_storico))
     app.add_handler(CommandHandler("export_ops", cmd_export_ops))
