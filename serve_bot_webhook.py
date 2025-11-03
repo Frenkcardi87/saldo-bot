@@ -1,4 +1,4 @@
-# serve_bot_webhook.py
+# serve_bot_webhook.py (revision: drop resolve_used_update_types for wider PTB compatibility)
 import os
 import logging
 from typing import Optional
@@ -62,15 +62,16 @@ async def on_startup():
     factory = _get_app_factory()
     _application = factory(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else factory()
 
+    # Initialize/start PTB app
     await _application.initialize()
     await _application.start()
 
     url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
     try:
+        # Do NOT pass allowed_updates to be compatible across PTB versions
         await _application.bot.set_webhook(
             url=url,
-            secret_token=WEBHOOK_SECRET_TOKEN,
-            allowed_updates=_application.resolve_used_update_types(),
+            secret_token=WEBHOOK_SECRET_TOKEN
         )
         log.info(f"Webhook set to {url} (secret={bool(WEBHOOK_SECRET_TOKEN)})")
     except TelegramError as e:
