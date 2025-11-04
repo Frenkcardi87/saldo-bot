@@ -426,14 +426,12 @@ async def notify_admins(context: ContextTypes.DEFAULT_TYPE, request_id: int, use
                         chat_id=admin_id,
                         photo=photo,
                         caption=message,
-                        parse_mode="Markdown",
                         reply_markup=keyboard
                     )
             else:
                 await context.bot.send_message(
                     chat_id=admin_id,
                     text=message,
-                    parse_mode="Markdown",
                     reply_markup=keyboard
                 )
         except Exception as e:
@@ -465,8 +463,7 @@ async def notify_user_request_result(context: ContextTypes.DEFAULT_TYPE, user_id
         
         await context.bot.send_message(
             chat_id=tg_id,
-            text=message,
-            parse_mode="Markdown"
+            text=message
         )
     except Exception as e:
         log.warning(f"Failed to notify user {user_id}: {e}")
@@ -745,9 +742,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if chat:
-            await context.bot.send_message(chat_id=chat.id, text=msg, parse_mode="Markdown", reply_markup=kb)
+            await context.bot.send_message(chat_id=chat.id, text=msg, reply_markup=kb)
         elif update.message:
-            await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+            await update.message.reply_text(msg, reply_markup=kb)
     except Exception as e:
         log.exception("START_REPLY_FAILED: %s", e)
 
@@ -800,7 +797,7 @@ async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"{created_at} — {sign}{abs(delta):g} kWh • {reason}{sslot}")
     else:
         lines.append("Nessuna operazione recente.")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(lines))
 
 async def cmd_storico(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show user operation history"""
@@ -821,7 +818,7 @@ async def cmd_storico(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sign = "➕" if delta >= 0 else "➖"
         sslot = f" (slot {slot})" if slot else ""
         msg.append(f"{created_at} — {sign}{abs(delta):g} kWh • {reason}{sslot}")
-    await update.message.reply_text("\n".join(msg), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(msg))
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show pending credit requests - admin sees all, users see only their own"""
@@ -863,9 +860,9 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton(f"❌ Rifiuta #{req_id}", callback_data=f"CR_REJECT:{req_id}")
                 ])
             markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=markup)
+            await update.message.reply_text(msg, reply_markup=markup)
         else:
-            await update.message.reply_text(msg, parse_mode="Markdown")
+            await update.message.reply_text(msg)
     else:
         # Regular user sees only their own pending requests
         row = await get_user_by_tgid(caller)
@@ -889,7 +886,7 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{'📝 ' + note if note else ''}\n"
             )
         
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await update.message.reply_text("\n".join(lines))
 
 async def cmd_export_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Export operations to CSV (admin only)"""
@@ -971,7 +968,7 @@ async def cmd_addebita(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if old_bal is not None and new_bal is not None and old_bal == new_bal and (old_bal - amount) < 0:
             await update.message.reply_text("❗ Saldo insufficiente e negativo non consentito per questo utente.")
         else:
-            await update.message.reply_text("❗ Errore (limiti o policy).")
+            await update.message.reply_text("❗ Errore: limiti o saldo insufficiente.")
         return
 
     name = await _get_user_name(uid)
@@ -1079,19 +1076,19 @@ async def on_ac_pick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _log_event("AC_PICK_USER", admin=q.from_user.id, user_id=uid)
 
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📜 Storico ultime 10", callback_data=f"ACH:{uid}")]])
-    await q.edit_message_text("Inserisci la quantità di kWh da accreditare (es. 10 o 12,5):")
+    await q.edit_message_text("✏️ Inserisci i kWh da accreditare (es. 10 o 15,345):")
     await q.edit_message_reply_markup(reply_markup=kb)
     return ACState.ASK_AMOUNT
 
 async def on_ac_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     if not _is_number(txt):
-        await update.message.reply_text("Valore non valido. Inserisci un numero (es. 10 oppure 12,5).")
+        await update.message.reply_text("⚠️ Inserisci i kWh ricaricati (es. 10 o 15,345).")
         return ACState.ASK_AMOUNT
 
     amount = round(float(txt.replace(",", ".")), 3)
     if amount <= 0:
-        await update.message.reply_text("L'importo deve essere maggiore di zero.")
+        await update.message.reply_text("⚠️ Il valore deve essere maggiore di zero.")
         return ACState.ASK_AMOUNT
     if amount > MAX_CREDIT_PER_OP:
         await update.message.reply_text(f"L'importo massimo per singola operazione è {MAX_CREDIT_PER_OP:g} kWh.")
@@ -1118,8 +1115,7 @@ async def on_ac_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"Ok, accredito **{amount:g} kWh**.\nVuoi indicare lo slot?",
-        reply_markup=kb,
-        parse_mode="Markdown"
+        reply_markup=kb
     )
     return ACState.ASK_SLOT
 
@@ -1140,7 +1136,7 @@ async def on_ac_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✅ Conferma", callback_data="ACC:OK"),
          InlineKeyboardButton("❌ Annulla",  callback_data="ACC:NO")]
     ])
-    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+    await q.edit_message_text(text, reply_markup=kb)
     return ACState.CONFIRM
 
 async def on_ac_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1159,7 +1155,7 @@ async def on_ac_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, old_bal, new_bal = await accredita_kwh(uid, amount, slot, admin_id)
     if not ok:
         _log_event("AC_CREDIT_FAIL", user_id=uid, amount=amount)
-        await q.edit_message_text("❗ Errore durante l'accredito (limiti/policy).")
+        await q.edit_message_text("❗ Errore: limiti o saldo insufficiente.")
         return ConversationHandler.END
 
     name = await _get_user_name(uid)
@@ -1170,7 +1166,7 @@ async def on_ac_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"*Saldo prima:* {old_bal:.2f} kWh\n"
         f"*Saldo dopo:*  {new_bal:.2f} kWh"
     )
-    await q.edit_message_text(summary, parse_mode="Markdown")
+    await q.edit_message_text(summary)
 
     try:
         tg = await get_tgid_by_userid(uid)
@@ -1201,7 +1197,7 @@ async def on_ac_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sign = "➕" if delta >= 0 else "➖"
         sslot = f" (slot {slot})" if slot else ""
         lines.append(f"{created_at} — {sign}{abs(delta):g} kWh • {reason}{sslot}")
-    await q.edit_message_text("\n".join(lines), parse_mode="Markdown")
+    await q.edit_message_text("\n".join(lines))
     return ACState.SELECT_USER
 
 # ====================
@@ -1269,17 +1265,17 @@ async def on_ad_pick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.setdefault('ad', {})['user_id'] = uid
     _log_event("AD_PICK_USER", admin=q.from_user.id, user_id=uid)
 
-    await q.edit_message_text("Inserisci la quantità di kWh da addebitare (es. 5 o 7,5).")
+    await q.edit_message_text("✏️ Inserisci i kWh da addebitare (es. 10 o 15,345).")
     return ADState.ASK_AMOUNT
 
 async def on_ad_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     if not _is_number(txt):
-        await update.message.reply_text("Valore non valido. Inserisci un numero (es. 5 oppure 7,5).")
+        await update.message.reply_text("⚠️ Inserisci i kWh ricaricati (es. 10 o 15,345).")
         return ADState.ASK_AMOUNT
     amount = round(float(txt.replace(",", ".")), 3)
     if amount <= 0:
-        await update.message.reply_text("L'importo deve essere maggiore di zero.")
+        await update.message.reply_text("⚠️ Il valore deve essere maggiore di zero.")
         return ADState.ASK_AMOUNT
     if amount > MAX_CREDIT_PER_OP:
         await update.message.reply_text(f"Massimo per singola operazione: {MAX_CREDIT_PER_OP:g}.")
@@ -1306,8 +1302,7 @@ async def on_ad_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"Ok, addebito **{amount:g} kWh**.\nVuoi indicare lo slot?",
-        reply_markup=kb,
-        parse_mode="Markdown"
+        reply_markup=kb
     )
     return ADState.ASK_SLOT
 
@@ -1328,7 +1323,7 @@ async def on_ad_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✅ Conferma", callback_data="ADD:OK"),
          InlineKeyboardButton("❌ Annulla",  callback_data="ADD:NO")]
     ])
-    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+    await q.edit_message_text(text, reply_markup=kb)
     return ADState.CONFIRM
 
 async def on_ad_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1350,7 +1345,7 @@ async def on_ad_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if old_bal is not None and new_bal is not None and old_bal == new_bal and (old_bal - amount) < 0:
             await q.edit_message_text("❗ Saldo insufficiente e negativo non consentito per questo utente.")
         else:
-            await q.edit_message_text("❗ Errore (limiti/policy). Operazione annullata.")
+            await q.edit_message_text("❗ Errore: limiti o saldo insufficiente.")
         return ConversationHandler.END
 
     name = await _get_user_name(uid)
@@ -1361,15 +1356,14 @@ async def on_ad_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"*Saldo prima:* {old_bal:.2f} kWh\n"
         f"*Saldo dopo:*  {new_bal:.2f} kWh"
     )
-    await q.edit_message_text(summary, parse_mode="Markdown")
+    await q.edit_message_text(summary)
 
     try:
         tg = await get_tgid_by_userid(uid)
         if tg:
             await context.bot.send_message(
                 chat_id=tg,
-                text=f"⚠️ Ti sono stati *addebitati* {amount:g} kWh.\nSaldo: {old_bal:.2f} → {new_bal:.2f} kWh",
-                parse_mode="Markdown"
+                text=f"⚠️ Ti sono stati *addebitati* {amount:g} kWh.\nSaldo: {old_bal:.2f} → {new_bal:.2f} kWh"
             )
     except Exception:
         pass
@@ -1399,25 +1393,23 @@ async def cmd_ricarica(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['cr'] = {}
     _log_event("CR_START", user_id=user_id)
     
-    # Build slot selection keyboard
-    slot_buttons = []
-    for i, slot in enumerate(SLOTS):
-        slot_buttons.append(InlineKeyboardButton(slot.title(), callback_data=f"CRS:{slot}"))
-        if (i + 1) % 3 == 0:  # 3 buttons per row
-            kb_rows = slot_buttons if 'kb_rows' not in locals() else kb_rows + [slot_buttons]
-            slot_buttons = []
-    
-    if slot_buttons:  # Add remaining buttons
-        kb_rows = slot_buttons if 'kb_rows' not in locals() else kb_rows + [slot_buttons]
-    else:
-        kb_rows = []
-    
-    kb = InlineKeyboardMarkup(kb_rows if kb_rows else [[InlineKeyboardButton("Wallet", callback_data="CRS:wallet")]])
+    # Build slot selection keyboard (3 per riga)
+rows = []
+row = []
+for slot in SLOTS:
+    row.append(InlineKeyboardButton(slot.title(), callback_data=f"CRS:{slot}"))
+    if len(row) == 3:
+        rows.append(row)
+        row = []
+if row:
+    rows.append(row)
+if not rows:
+    rows = [[InlineKeyboardButton("Wallet", callback_data="CRS:wallet")]]
+kb = InlineKeyboardMarkup(rows)
     
     await update.message.reply_text(
         "📋 *Richiesta di Ricarica*\n\n"
         "Seleziona lo slot da ricaricare:",
-        parse_mode="Markdown",
         reply_markup=kb
     )
     return CRState.ASK_SLOT
@@ -1433,8 +1425,7 @@ async def on_cr_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await q.edit_message_text(
         f"📍 Slot selezionato: *{slot}*\n\n"
-        f"Inserisci la quantità di kWh da ricaricare (es. 10 o 12,5):",
-        parse_mode="Markdown"
+        f"Inserisci i kWh da ricaricare (es. 10 o 15,345):"
     )
     return CRState.ASK_KWH
 
@@ -1442,12 +1433,12 @@ async def on_cr_kwh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle kWh input"""
     txt = (update.message.text or "").strip()
     if not _is_number(txt):
-        await update.message.reply_text("⚠️ Valore non valido. Inserisci un numero (es. 10 oppure 12,5).")
+        await update.message.reply_text("⚠️ ⚠️ Inserisci i kWh ricaricati (es. 10 o 15,345).")
         return CRState.ASK_KWH
     
     kwh = round(float(txt.replace(",", ".")), 3)
     if kwh <= 0:
-        await update.message.reply_text("⚠️ La quantità deve essere maggiore di zero.")
+        await update.message.reply_text("⚠️ Il valore deve essere maggiore di zero.")
         return CRState.ASK_KWH
     
     context.user_data['cr']['kwh'] = kwh
@@ -1456,8 +1447,7 @@ async def on_cr_kwh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"⚡ kWh: *{kwh:g}*\n\n"
         f"📸 Invia ora la *foto* della ricarica come prova.\n"
-        f"_(Obbligatorio)_",
-        parse_mode="Markdown"
+        f"_(Obbligatorio)_"
     )
     return CRState.ASK_PHOTO
 
@@ -1493,7 +1483,6 @@ async def on_cr_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ Foto ricevuta!\n\n"
         "📝 Vuoi aggiungere una nota opzionale?\n"
         "_(Scrivi la nota o premi Salta)_",
-        parse_mode="Markdown",
         reply_markup=kb
     )
     return CRState.ASK_NOTE
@@ -1516,13 +1505,12 @@ async def on_cr_skip_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     
     await q.edit_message_text(
-        f"📋 *Riepilogo Richiesta*\n\n"
+        f"📋 Riepilogo richiesta\n\n"
         f"📍 Slot: {slot}\n"
         f"⚡ kWh: {kwh:g}\n"
         f"📸 Foto: allegata\n"
         f"📝 Nota: _nessuna_\n\n"
         f"Confermi l'invio?",
-        parse_mode="Markdown",
         reply_markup=kb
     )
     return CRState.CONFIRM
@@ -1544,13 +1532,12 @@ async def on_cr_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     
     await update.message.reply_text(
-        f"📋 *Riepilogo Richiesta*\n\n"
+        f"📋 Riepilogo richiesta\n\n"
         f"📍 Slot: {slot}\n"
         f"⚡ kWh: {kwh:g}\n"
         f"📸 Foto: allegata\n"
         f"📝 Nota: {note_text}\n\n"
         f"Confermi l'invio?",
-        parse_mode="Markdown",
         reply_markup=kb
     )
     return CRState.CONFIRM
@@ -1585,13 +1572,12 @@ async def on_cr_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _log_event("CR_CREATED", request_id=request_id, user_id=user_id, slot=slot, kwh=kwh)
         
         await q.edit_message_text(
-            f"✅ *Richiesta inviata con successo!*\n\n"
+            f"✅ *Richiesta inviata!*\n\n"
             f"📋 Richiesta #{request_id}\n"
             f"📍 Slot: {slot}\n"
             f"⚡ kWh: {kwh:g}\n\n"
             f"Ti avviseremo appena un amministratore la verifica.\n"
-            f"Usa /pending per controllare lo stato.",
-            parse_mode="Markdown"
+            f"Usa /pending per controllare lo stato."
         )
         
         # Notify admins
@@ -1631,8 +1617,7 @@ async def on_photo_with_caption(update: Update, context: ContextTypes.DEFAULT_TY
     if len(parts) < 2:
         await update.message.reply_text(
             "⚠️ Formato non valido.\n"
-            "Usa: `slot3 4.5` o `slot8 10 nota opzionale`",
-            parse_mode="Markdown"
+            "Usa: `slot3 4.5` o `slot8 10 nota opzionale`"
         )
         return
     
@@ -1644,8 +1629,7 @@ async def on_photo_with_caption(update: Update, context: ContextTypes.DEFAULT_TY
     if slot not in [s.lower() for s in SLOTS]:
         await update.message.reply_text(
             f"⚠️ Slot non valido: {slot}\n"
-            f"Slot disponibili: {', '.join(SLOTS)}",
-            parse_mode="Markdown"
+            f"Slot disponibili: {', '.join(SLOTS)}"
         )
         return
     
@@ -1656,7 +1640,7 @@ async def on_photo_with_caption(update: Update, context: ContextTypes.DEFAULT_TY
     
     kwh = round(float(kwh_str), 3)
     if kwh <= 0:
-        await update.message.reply_text("⚠️ La quantità deve essere maggiore di zero.")
+        await update.message.reply_text("⚠️ Il valore deve essere maggiore di zero.")
         return
     
     # Download photo
@@ -1682,8 +1666,7 @@ async def on_photo_with_caption(update: Update, context: ContextTypes.DEFAULT_TY
             f"📋 #{request_id}\n"
             f"📍 {slot} | ⚡ {kwh:g} kWh\n"
             f"{'📝 ' + note if note else ''}\n\n"
-            f"Ti avviseremo dell'esito.",
-            parse_mode="Markdown"
+            f"Ti avviseremo dell'esito."
         )
         
         # Notify admins
@@ -1733,8 +1716,7 @@ async def on_cr_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(
             f"✅ *Richiesta #{request_id} APPROVATA*\n"
             f"da {admin_name}\n\n"
-            f"{details}",
-            parse_mode="Markdown"
+            f"{details}"
         )
         
         # Notify user
@@ -1777,8 +1759,7 @@ async def on_cr_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_reply_markup(reply_markup=None)
         await q.message.reply_text(
             f"❌ *Richiesta #{request_id} RIFIUTATA*\n"
-            f"da {admin_name}",
-            parse_mode="Markdown"
+            f"da {admin_name}"
         )
         
         # Notify user
