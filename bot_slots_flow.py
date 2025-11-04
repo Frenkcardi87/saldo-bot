@@ -971,7 +971,7 @@ async def cmd_addebita(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if old_bal is not None and new_bal is not None and old_bal == new_bal and (old_bal - amount) < 0:
             await update.message.reply_text("❗ Saldo insufficiente e negativo non consentito per questo utente.")
         else:
-            await update.message.reply_text("❗ Errore: limiti o saldo insufficiente.")
+            await update.message.reply_text("❗ Errore (limiti o policy).")
         return
 
     name = await _get_user_name(uid)
@@ -1079,19 +1079,19 @@ async def on_ac_pick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _log_event("AC_PICK_USER", admin=q.from_user.id, user_id=uid)
 
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📜 Storico ultime 10", callback_data=f"ACH:{uid}")]])
-    await q.edit_message_text("✏️ Inserisci i kWh da accreditare (es. 10 o 15,345):")
+    await q.edit_message_text("Inserisci la quantità di kWh da accreditare (es. 10 o 12,5):")
     await q.edit_message_reply_markup(reply_markup=kb)
     return ACState.ASK_AMOUNT
 
 async def on_ac_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     if not _is_number(txt):
-        await update.message.reply_text("⚠️ Inserisci i kWh ricaricati (es. 10 o 15,345).")
+        await update.message.reply_text("Valore non valido. Inserisci un numero (es. 10 oppure 12,5).")
         return ACState.ASK_AMOUNT
 
     amount = round(float(txt.replace(",", ".")), 3)
     if amount <= 0:
-        await update.message.reply_text("⚠️ Il valore deve essere maggiore di zero.")
+        await update.message.reply_text("L'importo deve essere maggiore di zero.")
         return ACState.ASK_AMOUNT
     if amount > MAX_CREDIT_PER_OP:
         await update.message.reply_text(f"L'importo massimo per singola operazione è {MAX_CREDIT_PER_OP:g} kWh.")
@@ -1159,7 +1159,7 @@ async def on_ac_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, old_bal, new_bal = await accredita_kwh(uid, amount, slot, admin_id)
     if not ok:
         _log_event("AC_CREDIT_FAIL", user_id=uid, amount=amount)
-        await q.edit_message_text("❗ Errore: limiti o saldo insufficiente.")
+        await q.edit_message_text("❗ Errore durante l'accredito (limiti/policy).")
         return ConversationHandler.END
 
     name = await _get_user_name(uid)
@@ -1269,17 +1269,17 @@ async def on_ad_pick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.setdefault('ad', {})['user_id'] = uid
     _log_event("AD_PICK_USER", admin=q.from_user.id, user_id=uid)
 
-    await q.edit_message_text("✏️ Inserisci i kWh da addebitare (es. 10 o 15,345).")
+    await q.edit_message_text("Inserisci la quantità di kWh da addebitare (es. 5 o 7,5).")
     return ADState.ASK_AMOUNT
 
 async def on_ad_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     if not _is_number(txt):
-        await update.message.reply_text("⚠️ Inserisci i kWh ricaricati (es. 10 o 15,345).")
+        await update.message.reply_text("Valore non valido. Inserisci un numero (es. 5 oppure 7,5).")
         return ADState.ASK_AMOUNT
     amount = round(float(txt.replace(",", ".")), 3)
     if amount <= 0:
-        await update.message.reply_text("⚠️ Il valore deve essere maggiore di zero.")
+        await update.message.reply_text("L'importo deve essere maggiore di zero.")
         return ADState.ASK_AMOUNT
     if amount > MAX_CREDIT_PER_OP:
         await update.message.reply_text(f"Massimo per singola operazione: {MAX_CREDIT_PER_OP:g}.")
@@ -1350,7 +1350,7 @@ async def on_ad_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if old_bal is not None and new_bal is not None and old_bal == new_bal and (old_bal - amount) < 0:
             await q.edit_message_text("❗ Saldo insufficiente e negativo non consentito per questo utente.")
         else:
-            await q.edit_message_text("❗ Errore: limiti o saldo insufficiente.")
+            await q.edit_message_text("❗ Errore (limiti/policy). Operazione annullata.")
         return ConversationHandler.END
 
     name = await _get_user_name(uid)
@@ -1433,7 +1433,7 @@ async def on_cr_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await q.edit_message_text(
         f"📍 Slot selezionato: *{slot}*\n\n"
-        f"Inserisci i kWh da ricaricare (es. 10 o 15,345):",
+        f"Inserisci la quantità di kWh da ricaricare (es. 10 o 12,5):",
         parse_mode="Markdown"
     )
     return CRState.ASK_KWH
@@ -1442,12 +1442,12 @@ async def on_cr_kwh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle kWh input"""
     txt = (update.message.text or "").strip()
     if not _is_number(txt):
-        await update.message.reply_text("⚠️ Inserisci i kWh ricaricati (es. 10 o 15,345).")
+        await update.message.reply_text("⚠️ Valore non valido. Inserisci un numero (es. 10 oppure 12,5).")
         return CRState.ASK_KWH
     
     kwh = round(float(txt.replace(",", ".")), 3)
     if kwh <= 0:
-        await update.message.reply_text("⚠️ Il valore deve essere maggiore di zero.")
+        await update.message.reply_text("⚠️ La quantità deve essere maggiore di zero.")
         return CRState.ASK_KWH
     
     context.user_data['cr']['kwh'] = kwh
@@ -1516,7 +1516,7 @@ async def on_cr_skip_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     
     await q.edit_message_text(
-        f"📋 Riepilogo richiesta\n\n"
+        f"📋 *Riepilogo Richiesta*\n\n"
         f"📍 Slot: {slot}\n"
         f"⚡ kWh: {kwh:g}\n"
         f"📸 Foto: allegata\n"
@@ -1544,7 +1544,7 @@ async def on_cr_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     
     await update.message.reply_text(
-        f"📋 Riepilogo richiesta\n\n"
+        f"📋 *Riepilogo Richiesta*\n\n"
         f"📍 Slot: {slot}\n"
         f"⚡ kWh: {kwh:g}\n"
         f"📸 Foto: allegata\n"
@@ -1585,7 +1585,7 @@ async def on_cr_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _log_event("CR_CREATED", request_id=request_id, user_id=user_id, slot=slot, kwh=kwh)
         
         await q.edit_message_text(
-            f"✅ *Richiesta inviata!*\n\n"
+            f"✅ *Richiesta inviata con successo!*\n\n"
             f"📋 Richiesta #{request_id}\n"
             f"📍 Slot: {slot}\n"
             f"⚡ kWh: {kwh:g}\n\n"
@@ -1656,7 +1656,7 @@ async def on_photo_with_caption(update: Update, context: ContextTypes.DEFAULT_TY
     
     kwh = round(float(kwh_str), 3)
     if kwh <= 0:
-        await update.message.reply_text("⚠️ Il valore deve essere maggiore di zero.")
+        await update.message.reply_text("⚠️ La quantità deve essere maggiore di zero.")
         return
     
     # Download photo
