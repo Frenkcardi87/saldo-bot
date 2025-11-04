@@ -1394,18 +1394,18 @@ async def cmd_ricarica(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _log_event("CR_START", user_id=user_id)
     
     # Build slot selection keyboard (3 per riga)
-rows = []
-row = []
-for slot in SLOTS:
-    row.append(InlineKeyboardButton(slot.title(), callback_data=f"CRS:{slot}"))
-    if len(row) == 3:
+    rows = []
+    row = []
+    for slot in SLOTS:
+        row.append(InlineKeyboardButton(slot.title(), callback_data=f"CRS:{slot}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
         rows.append(row)
-        row = []
-if row:
-    rows.append(row)
-if not rows:
-    rows = [[InlineKeyboardButton("Wallet", callback_data="CRS:wallet")]]
-kb = InlineKeyboardMarkup(rows)
+    if not rows:
+        rows = [[InlineKeyboardButton("Wallet", callback_data="CRS:wallet")]]
+    kb = InlineKeyboardMarkup(rows)
     
     await update.message.reply_text(
         "📋 *Richiesta di Ricarica*\n\n"
